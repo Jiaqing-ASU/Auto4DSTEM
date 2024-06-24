@@ -5,6 +5,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+import m3_learning.nn.STEM_AE_DCT.spot_fitting as spot
+import warnings
+warnings.filterwarnings("ignore")
+
 
 def crop_small_square(center_coordinates, radius=50):
     """function to crop small square image for revise operation
@@ -432,6 +436,9 @@ class Encoder(nn.Module):
         reduced_size=20,
         interpolate_mode="bicubic",
         affine_mode="bicubic",
+        emb_function='ktop',
+        coords = None,
+        r = None
     ):
         """_summary_
 
@@ -526,7 +533,7 @@ class Encoder(nn.Module):
         self.affine_mode = affine_mode
         self.up_size = up_size
         
-        if fixed_mask != None:
+        if fixed_mask is not None:
         # Set the mask_ to upscale mask if the interpolate mode is True
             if self.interpolate:
                 mask_with_inp = []
@@ -558,13 +565,7 @@ class Encoder(nn.Module):
         # Set the all the adj parameter to be the same
             self.dense = nn.Linear(reduced_size + num_base, self.embedding_size)
             
-        # set the number of base (number of cluster)
-        self.for_k = nn.Linear(reduced_size, num_base)
-        self.norm = nn.LayerNorm(num_base)
-        self.softmax = nn.Softmax()
         
-        # k is set to be 1 means one input only belongs to 1 cluster
-        self.num_k_sparse = 1
 
         self.radius = radius
         self.coef = coef
@@ -584,8 +585,43 @@ class Encoder(nn.Module):
             trans_limit,
             adj_mask_para,
         ).to(device)
-        
-    # create K-sparse strategy for classification
+           
+        if emb_function == 'ktop': 
+            # set the number of base (number of cluster)
+            self.for_k = nn.Linear(reduced_size, num_base)
+            self.norm = nn.LayerNorm(num_base)
+            self.softmax = nn.Softmax()
+            
+            # k is set to be 1 means one input only belongs to 1 cluster
+            self.num_k_sparse = 1
+            self.emb_func = self.ktop
+            
+        if emb_function == 'spots': 
+            self.tanh=nn.Tanh()
+            self.emb_dense = nn.Linear(reduced_size, num_base)
+            self.norm = nn.LayerNorm(num_base)
+            self.coords = coords
+            if self.coords is None: self.coords = [(self.input_size_0 //2,self.input_size_0 //2) for i in range(num_base//2)]
+            self.r = r
+            if self.r is None: self.r = self.input_size_0//2
+            self.emb_func = self.spots 
+            
+    # @property
+    # def device(self):
+    #     return self._device
+
+    # @device.setter
+    # def device(self, device):
+    #     self._device = device
+    #     self.to(device)
+    #     self._set_submodules_device(self, device)
+
+    # def _set_submodules_device(self, module, device):
+    #     for submodule in module.children():
+    #         submodule.to(device)
+    #         self._set_submodules_device(submodule, device)
+    #             # create K-sparse strategy for classification
+                
     def ktop(self, x):
         """ktop function
 
@@ -611,6 +647,23 @@ class Encoder(nn.Module):
                     raw[~mask] = 1
         return k_no
 
+    def spots(self, x,):  
+        """generates predicted coordinates of each spot in base
+
+        Returns:
+            x: input of shape (N, S*2) where S is the number of spots
+        """        
+        
+        # self = self.to(self.device)
+        # print('\t\t\tspots:', f'x:{x.device}', f'w:{self.dense.bias.device}')
+                
+        coords =  torch.tensor(self.coords).flatten().to(x.device) # numspots,2
+        out = self.emb_dense(x)
+        out = self.norm(out)
+        # out = self.tanh(out)*self.r
+        out = (self.tanh(out)*self.r/5 + coords)
+        return out
+ 
     def forward(self, x, rotate_value=None):
         """forward function for nn.Module class
 
@@ -618,6 +671,11 @@ class Encoder(nn.Module):
             x (torch.tensor): input torch.tensor image
             rotate_value (float, optional): float value represents pretrained rotation angle. Defaults to None.
         """
+        # make sure all devices the same for dataparallel
+        # self.device = x.device
+        # self = self.to(self.device)
+        # print('\tenc:', f'x:{x.device}', f'w:{self.dense.bias.device}')
+        
         
         # reshape the input into (minibatch, 1 , image_size)
         out = x.view(-1, 1, self.input_size_0, self.input_size_1)
@@ -627,11 +685,13 @@ class Encoder(nn.Module):
         out = self.cov2d_1(out)
         out = torch.flatten(out, start_dim=1)
         kout = self.before(out)
-
-        k_out = self.ktop(kout)
+        # print('\t\tpre:', f'x:{x.device}', f'w:{self.dense.bias.device}')
+        
+        k_out = self.emb_func(kout)
+        # print('\t\tpost:', f'x:{x.device}', f'w:{self.dense.bias.device}')
         
         # concatenate reduced dimensional vector and output vector of k-sparse function
-        out = torch.cat((kout, k_out), dim=1).to(self.device)
+        out = torch.cat((kout, k_out), dim=1).to(x.device)
         out = self.dense(out)
 
         scaler_shear, rotation, translation, mask_parameter = self.affine_matrix(
@@ -647,7 +707,6 @@ class Encoder(nn.Module):
 
             grid_2 = F.affine_grid(rotation.to(self.device), x.size()).to(self.device)
             output = F.grid_sample(out_sc_sh, grid_2)
-
         else:
             x_inp = x.view(-1, 1, self.input_size_0, self.input_size_1)
 
@@ -665,6 +724,7 @@ class Encoder(nn.Module):
             )
             output = F.grid_sample(out_sc_sh, grid_2, mode=self.affine_mode)
             
+        
         # apply inverse affine to each diffraction spot if interpolate is True
         if self.interpolate:
             # Test 1.5 is good for 5%-45% background noise, add to 2 for larger noise and rot512x512 4dstem
@@ -815,19 +875,23 @@ class Joint(nn.Module):
         """
 
         if self.interpolate:
-            (
-                predicted_revise,
-                k_out,
-                scaler_shear,
-                rotation,
-                adj_mask,
-                x_inp,
+            (predicted_revise,
+            k_out,
+            scaler_shear,
+            rotation,
+            translation,
+            adj_mask,
+            x_inp,
             ) = self.encoder(x, rotate_value)
 
         else:
-            predicted_revise, k_out, scaler_shear, rotation, adj_mask = self.encoder(
-                x, rotate_value
-            )
+            (predicted_revise, 
+             k_out, 
+             scaler_shear, 
+             rotation, 
+             translation, 
+             adj_mask 
+            ) = self.encoder(x, rotate_value)
         # create identity matrix for computing inverse affine matrix 
         identity = (
             torch.tensor([0, 0, 1], dtype=torch.float)
@@ -881,31 +945,29 @@ class Joint(nn.Module):
         # create new mask list to save updated mask region with inverse affine transform
 
         new_list = []
+        if self.mask is not None:
+            for mask_ in self.mask:
+                batch_mask = (
+                    mask_.reshape(1, 1, mask_.shape[-2], mask_.shape[-1]
+                                  )).repeat(x.shape[0],0)
 
-        for mask_ in self.mask:
-            batch_mask = (
-                mask_.reshape(1, 1, mask_.shape[-2], mask_.shape[-1])
-                .repeat(x.shape[0], 1, 1, 1)
-                .to(self.device)
-            )
+                batch_mask = torch.tensor(batch_mask, dtype=torch.float).to(self.device)
 
-            batch_mask = torch.tensor(batch_mask, dtype=torch.float).to(self.device)
+                rotated_mask = F.grid_sample(batch_mask, grid_2)
 
-            rotated_mask = F.grid_sample(batch_mask, grid_2)
+                if self.interpolate:
+            # Add reverse affine transform of scale and shear to make all spots in the mask region, crucial when mask region small
+                    rotated_mask = F.grid_sample(rotated_mask, grid_1)
 
-            if self.interpolate:
-        # Add reverse affine transform of scale and shear to make all spots in the mask region, crucial when mask region small
-                rotated_mask = F.grid_sample(rotated_mask, grid_1)
+            # maintain the correct size of mask region after affine transformation
+                rotated_mask[rotated_mask < 0.5] = 0
+                rotated_mask[rotated_mask >= 0.5] = 1
 
-        # maintain the correct size of mask region after affine transformation
-            rotated_mask[rotated_mask < 0.5] = 0
-            rotated_mask[rotated_mask >= 0.5] = 1
+                rotated_mask = (
+                    torch.tensor(rotated_mask, dtype=torch.bool).squeeze().to(self.device)
+                )
 
-            rotated_mask = (
-                torch.tensor(rotated_mask, dtype=torch.bool).squeeze().to(self.device)
-            )
-
-            new_list.append(rotated_mask)
+                new_list.append(rotated_mask)
 
         if self.interpolate:
          # apply inverse affine transform to recreate input image
@@ -922,7 +984,7 @@ class Joint(nn.Module):
                 affine_mode=self.affine_mode,
             )
 
-        # change predicted_base to predicted_base_inp, add new_list when interpolate mode is True
+            # change predicted_base to predicted_base_inp, add new_list when interpolate mode is True
             return (
                 predicted_revise,
                 predicted_base_inp,
@@ -948,6 +1010,368 @@ class Joint(nn.Module):
             )
 
 
+class PV_Joint(Joint):
+    def __init__(self,pv_model,coords,r,orig_size,
+                 encoder,decoder,device,radius=60,coef=1.5,
+                 interp_size=None,
+                 interpolate_mode="bicubic",affine_mode="bicubic",
+                 masking='None'):
+        """_summary_
+
+        Args:
+            pv_model (_type_): model for fitting gaussian spots. returns 
+            coords (_type_): _description_
+            r (_type_): _description_
+            orig_size (_type_): _description_
+            encoder (_type_): _description_
+            decoder (_type_): _description_
+            device (_type_): _description_
+            radius (int, optional): _description_. Defaults to 60.
+            coef (float, optional): _description_. Defaults to 1.5.
+            interp_size (_type_, optional): _description_. Defaults to None.
+            interpolate_mode (str, optional): _description_. Defaults to "bicubic".
+            affine_mode (str, optional): _description_. Defaults to "bicubic".
+        """        
+        super(PV_Joint, self).__init__(encoder,decoder,device,radius,coef,interpolate_mode,affine_mode)
+        self.pv_model = pv_model
+        self.device=device
+        self.tile_coords = torch.tensor(coords).float()
+        self.r = r
+        self.orig_size = orig_size
+        
+        self.interp_size = self.orig_size if interp_size is None else interp_size
+        self.interp_factor = interp_size[-1]/orig_size[-1]
+        self.r_inp = int(self.r*self.interp_factor)
+        self.interp_mode = 'bilinear'
+        self.revise_affine = True
+        
+        self.masking=masking
+        if self.masking=='threshold':
+            self.mask_thresh=0.5
+            self.num_pxs=100
+        if self.masking=='circle':
+            self.mask_r = self.r//1.25 #torch.nn.Parameter(torch.tensor([self.r]).float())
+            
+    # @property
+    # def device(self):
+    #     return self._device
+
+    # @device.setter
+    # def device(self, device):
+    #     self._device = device
+    #     self.to(device)
+    #     self._set_submodules_device(self, device)
+
+    # def _set_submodules_device(self, module, device):
+    #     for submodule in module.children():
+    #         submodule.to(device)
+    #         self._set_submodules_device(submodule, device)
+            
+    def check_bounds(self,x1,x2,y1,y2,shape):
+        if abs(x2-x1)!=shape[0]: x2 = x1+shape[0]   
+        if abs(y2-y1)!=shape[1]: y2 = y1+shape[1]
+        return x1,x2,y1,y2
+    
+    def dilate_mask(self, base_mask, kernel_size=3, pxs=1):
+        dilation_kernel = torch.ones((1,1,kernel_size,kernel_size),dtype=torch.float32).to(self.device)
+        for i in range(pxs):
+            dilated = F.conv2d(base_mask,dilation_kernel,padding=(kernel_size//2,kernel_size//2))
+            base_mask = (dilated > 0).float()
+        return base_mask
+
+    def erode_mask(self,base_mask, kernel_size=3, pxs=1):
+        kernel = torch.ones((1,1,kernel_size,kernel_size),dtype=torch.float32).to(self.device)
+        for _ in range(pxs):
+            eroded = F.conv2d(base_mask, kernel, padding=kernel_size//2)
+            base_mask = (eroded == kernel.numel()).float()
+        return base_mask
+
+    def interpolate_images(self,images):
+        x_,y_ = images.shape[-2:]
+        interp_images = F.interpolate(
+                images.reshape(-1,1,x_,y_), 
+                size=( int(x_*self.interp_factor), int(y_*self.interp_factor) ), 
+                mode=self.interp_mode ).squeeze()
+        return interp_images
+
+    def interpolate_coords(self,coords):
+        return torch.round(coords*self.interp_factor).int()
+
+    def transform_coords(self,coords,thetas,b_,s_):
+        try: 
+            affine_coords = torch.cat([coords, torch.ones(s_,1).to(self.device)],axis=1).repeat(b_,1,1)
+            for theta in thetas:
+                affine_coords = torch.einsum( 'bse,bej->bsj',affine_coords,theta)
+        except:
+            affine_coords = torch.cat([coords, torch.ones(b_,s_,1).to(self.device)],axis=2)
+            for theta in thetas:
+                if theta.shape[1]==2:
+                    theta = torch.cat([theta, torch.zeros(b_,1,3).to(self.device)],axis=1)
+                    theta[:,2,:]=1
+                affine_coords = torch.einsum( 'bse,bej->bsj', affine_coords, theta)
+        return affine_coords
+            
+    def inverse_scaleshear(self, data, theta, coords, coords_, r, b_, s_, mask_r,
+                           masking='None', expand=1):
+        r_ = lambda r: int(r*expand)
+        # get tiles from affine basis at ae predicted coords
+        tiles = spot.get_tiles( data.squeeze(),coords.int(),r_(r) ) # shape spots,bsize,2 
+                                
+        try: 
+            tiles = torch.stack([torch.stack(tile) for tile in tiles]).float().to(self.device)
+        except:
+            tiles=torch.stack(tiles).float().to(self.device)
+            tiles = tiles.swapaxes(0,1)
+
+        grid = F.affine_grid( theta.repeat(s_,1,1)[:,:2,:].to(self.device), 
+                               (b_*s_,1,r*2,r*2) ).to(self.device)
+        out = F.grid_sample(tiles.reshape(-1,1,r*2,r*2), grid, 
+                            mode=self.affine_mode)
+        if masking=='circle':
+            cx,cy=coords_.reshape(-1,2)[:,0], coords_.reshape(-1,2)[:,1] # TODO:right?
+            masks = spot.get_circle_mask(mask_r,cx,cy,
+                        output_shape=(r*2,r*2),device=self.device)
+            out*=masks.reshape(-1,1,r*2,r*2)
+        
+        out = spot.replace_spots(out.reshape(b_,s_,r*2,r*2), coords, 
+                                 self.r_inp,  b_, s_,
+                                 output_size=data.shape[-2:], 
+                                 device=self.device)
+        return out
+
+
+    def set_device(self, device):
+        self.device = device
+        self.to(device)
+        for name, submodule in self.named_children():
+            submodule.to(device)
+            
+    def forward(self, x, rotate_value=None, unshear=True):
+        full,tiles = x
+        # self.device = full.device
+        b_,s_,x_,y_ = tiles.shape
+        # print('pv_joint:', x[0].device)
+        # self = self.to(x[0].device)
+        
+        # encoder
+        if self.interpolate:
+            (affine_base, # this uses full from different devices
+             ae_coords,
+             scaler_shear,
+             rotation,
+             translation,
+             adj_mask,
+             full_imp,
+            ) = self.encoder(full.reshape(b_,1,self.orig_size[-2],self.orig_size[-1]))
+        else:
+            (affine_base, 
+             ae_coords, 
+             scaler_shea, 
+             rotation, 
+             translation, 
+             adj_mask 
+            ) = self.encoder(full.reshape(b_,1,self.orig_size[-2],self.orig_size[-1]), rotate_value)
+        
+        ae_coords = ae_coords.reshape(b_,s_,2) # bsize, numspots, (x,y)
+        
+        # compute inverse affine matrix 
+        identity = ( torch.tensor([0, 0, 1], dtype=torch.float).reshape(1, 1, 3)
+                    .repeat(b_, 1, 1).to(self.device) )
+        new_theta_1 = torch.cat((scaler_shear, identity), axis=1).to(self.device)
+        new_theta_2 = torch.cat((rotation, identity), axis=1).to(self.device)
+        new_theta_3 = torch.cat((translation, identity), axis=1).to(self.device)
+        inver_theta_1 = torch.linalg.inv(new_theta_1)[:, 0:2].to(self.device)
+        inver_theta_2 = torch.linalg.inv(new_theta_2)[:, 0:2].to(self.device)
+        inver_theta_3 = torch.linalg.inv(new_theta_3)[:, 0:2].to(self.device)
+        # # Apply inverse_inverse affine to predicted ae_coords of basis. should be the true centers of the diff spots
+        # ae_inv_affine_coords = torch.cat([ae_coords, torch.ones(b_,s_,1).to(self.device)],axis=2)
+        # for theta in [inver_theta_1,inver_theta_2,inver_theta_3]:
+        #     _ =  torch.cat([theta, torch.zeros(b_,1,3).to(self.device)],axis=1)
+        #     _[:,2,:]=1
+        #     ae_inv_affine_coords = torch.einsum( 'bse,bej->bsj', ae_inv_affine_coords, _)
+
+        
+        # find pv fit and mask
+        tiles = tiles.reshape(b_*s_,x_,y_).to(self.device)
+        pv_embedding, pv_pred = self.pv_model(tiles)
+        # Find pv masks
+        if self.masking=='threshold': # TODO: test this
+            masks, mask_loss, mask_thresh, num_pxs = spot.get_mask_loss(tiles,pv_pred,mask_thresh=self.mask_thresh,i=self.num_pxs)
+            self.mask_thresh=mask_thresh
+            self.num_pxs=num_pxs
+            masks = masks.reshape(-1, self.r*2, self.r*2) # batch*tiles, ksize, ksize
+            dilated_masks = self.dilate_mask(masks.unsqueeze(1)).squeeze()
+            masked_tiles = (tiles*dilated_masks).reshape(b_,s_, self.r*2, self.r*2)
+            eroded_masks = self.erode_mask(dilated_masks.unsqueeze(1),pxs=2).squeeze()
+            masks = self.dilate_mask(eroded_masks.unsqueeze(1)).squeeze()    
+            centroids = spot.get_centroids(masks).reshape(b_,s_,2).to(self.device)            
+            
+            # superimpose mask on ktop TODO: change so the replacement is only done with orig shapes
+            base_masks = spot.replace_spots(masks.reshape(b_,s_,x_,y_),ae_coords,self.r,
+                                        new_centroids=centroids,
+                                        orig_size=self.orig_size,
+                                        interp_size=self.interp_size,
+                                        interp_mode=self.interp_mode,
+                                        device=self.device)
+            base_masks[base_masks<0.5] = 0
+            base_masks[base_masks>=0.5] = 1
+            predicted_base = spot.replace_spots(tiles.reshape(b_,s_,x_,y_),ae_coords,self.r,
+                                                new_centroids=centroids,
+                                                orig_size=self.orig_size,
+                                                interp_size=self.interp_size,
+                                                interp_mode=self.interp_mode,
+                                                device=self.device) # base
+            predicted_base *= base_masks
+        
+        if self.masking=='circle': 
+            # r = torch.nn.ReLU()(self.mask_r) +self.r/2 # should be true radius of spot
+            centroids = (ae_coords-self.tile_coords.to(self.device))
+            cy,cx = centroids.reshape(-1,2)[:,0],centroids.reshape(-1,2)[:,1]
+            masks = spot.get_circle_mask(self.mask_r,cx,cy,output_shape=(self.r*2,self.r*2),
+                        interp_factor=1,device=self.device)
+            masks,mask_loss,mask_thresh,num_pxs = spot.get_mask_loss(tiles,pv_pred,
+                                                                     masking='preset',masks=masks,
+                                                                     device=self.device)
+            masks_inp = spot.get_circle_mask(self.mask_r,output_shape=(x_,y_),
+                                            interp_factor=self.interp_factor,
+                                            device=self.device)
+            base_masks = spot.replace_spots(masks_inp.float(), 
+                                            self.interpolate_coords(ae_coords), 
+                                            self.r_inp, b_, s_, 
+                                            output_size=self.interp_size[-2:],
+                                            device=self.device)
+            
+        # put raw tiles on ae predicted coords. Labelled location superimposed on predicted. Not the true centers
+        ae_base = spot.replace_spots(self.interpolate_images(tiles).reshape(b_,s_,self.r_inp*2,self.r_inp*2), 
+                                    self.interpolate_coords(ae_coords), 
+                                    self.r_inp,b_,s_,
+                                    output_size=self.interp_size[-2:],
+                                    device=self.device).unsqueeze(1)
+        # # put raw tiles on inverse affine * ae predicted coords
+        # predicted_input = spot.replace_spots(tiles.reshape(b_,s_,x_,y_), ae_inv_affine_coords, self.r,
+        #                                 orig_size=self.orig_size,
+        #                                 interp_size=self.interp_size,
+        #                                 interp_mode=self.interp_mode,
+        #                                 device=self.device)
+        # put masks on raw coords
+        raw_masks = spot.replace_spots(masks_inp.float(), 
+                                       self.interpolate_coords(self.tile_coords.repeat(b_,1,1)), 
+                                       self.r_inp,b_,s_,
+                                        output_size=self.interp_size[-2:],
+                                        device=self.device)
+        
+        # contruct inverse affine grids. Used to apply transformation to predicted base
+        # ae_base = predicted_base
+        # ae_base = F.interpolate( predicted_base.unsqueeze(1),
+        #     size=(self.up_size, self.up_size),
+        #     mode=self.interpolate_mode )
+        grid_1 = F.affine_grid(inver_theta_1.to(self.device), ae_base.size()).to(self.device)
+        grid_2 = F.affine_grid(inver_theta_2.to(self.device), ae_base.size()).to(self.device)
+        grid_3 = F.affine_grid(inver_theta_3.to(self.device), ae_base.size()).to(self.device)
+        predicted_translation = F.grid_sample(ae_base, grid_3, mode=self.affine_mode)          
+        predicted_rotate = F.grid_sample(predicted_translation, grid_2, mode=self.affine_mode)
+        predicted_input = F.grid_sample(predicted_rotate, grid_1, mode=self.affine_mode)
+            
+        # TODO: do inv affine on predicted revise tiles so they match shape of input. make a bit bigger to avoid cropping
+        # get tiles from affine basis at ae predicted coords
+        # affine_tiles = spot.get_tiles( affine_base.squeeze(), 
+        #                                 torch.round( ae_coords.swapaxes ).int(), # shape spots,bsize,2 
+        #                                 int(self.r*1.5) ) 
+        # affine_tiles = torch.stack(affine_tiles).reshape(b_,s_,self.r*3,self.r*3)
+
+        # affine_coords = torch.cat([self.tile_coords, torch.ones(s_,1).to(self.device)],axis=1).repeat(b_,1,1)
+        # for theta in [new_theta_1,new_theta_2,new_theta_3]:
+        #     affine_coords = torch.einsum( 'bse,bej->bsj',affine_coords,theta)
+        
+        affine_coords = self.transform_coords(self.tile_coords.to(self.device),
+                                              [new_theta_1,new_theta_2,new_theta_3],
+                                              b_,s_)[:,:,:2]
+        if unshear:
+            affine_base = self.inverse_scaleshear(affine_base, inver_theta_1,
+                                              self.interpolate_coords(affine_coords),
+                                              self.interpolate_coords(ae_coords),
+                                              self.r_inp,b_,s_,int(self.mask_r*self.interp_factor),
+                                            #   masking=self.masking
+                                              ).unsqueeze(1)     
+        
+        pred_coords = self.transform_coords(ae_coords,[inver_theta_1,inver_theta_2,inver_theta_3],b_,s_)[:,:,:2]
+        if unshear:
+            predicted_input = self.inverse_scaleshear(predicted_input,new_theta_1,
+                                                  self.interpolate_coords(pred_coords),
+                                                  self.interpolate_coords(torch.zeros_like(pred_coords)),
+                                                  self.r_inp,b_,s_,int(self.mask_r*self.interp_factor),
+                                                #   masking=self.masking
+                                                  ).unsqueeze(1)
+        
+        # grid_1 = F.affine_grid(inver_theta_1.to(self.device), raw_tiles.size()).to(self.device)
+        # grid_2 = F.affine_grid(inver_theta_2.to(self.device), raw_tiles.size()).to(self.device)
+        # grid_3 = F.affine_grid(inver_theta_3.to(self.device), raw_tiles.size()).to(self.device)
+        # predicted_translation = F.grid_sample(ae_base, grid_3, mode=self.affine_mode)          
+        # predicted_rotate = F.grid_sample(predicted_translation, grid_2, mode=self.affine_mode)
+        # predicted_input = F.grid_sample(predicted_rotate, grid_1, mode=self.affine_mode)
+            
+        # affine_tiles *= inver_theta_3 # return the tiles to original square shape
+        
+        # affine_base_inp = spot.replace_spots(raw_tiles, affine_coords,self.r,
+        #                                 orig_size=self.orig_size,
+        #                                 interp_size=self.interp_size,
+        #                                 interp_mode=self.interp_mode,
+        #                                 device=self.device)
+        # # create new mask list to save updated mask region with inverse affine transform
+        # new_list = []
+        # for mask_ in [base_mask]:
+        #     batch_mask = (mask_.reshape(-1, 1, mask_.shape[-2], mask_.shape[-1]))
+        #     batch_mask = batch_mask.clone().detach().float().to(self.device)
+        #     rotated_mask = F.grid_sample(batch_mask, grid_2)
+
+        #     if self.interpolate:
+        # # Add reverse affine transform of scale and shear to make all spots in the mask region, crucial when mask region small
+        #         rotated_mask = F.grid_sample(rotated_mask, grid_1)
+
+        # # maintain the correct size of mask region after affine transformation
+        #     rotated_mask[rotated_mask < 0.5] = 0
+        #     rotated_mask[rotated_mask >= 0.5] = 1
+        #     rotated_mask = rotated_mask.clone().detach().squeeze().to(self.device)
+        #     new_list.append(rotated_mask)
+
+        # if self.interpolate:
+        #  # apply inverse affine transform to recreate input image
+        #     if self.revise_affine:
+        #         predicted_input_revise = revise_size_on_affine_gpu(
+        #             predicted_input,
+        #             base_masks,
+        #             b_,
+        #             inver_theta_1,
+        #             self.device,
+        #             adj_para=adj_mask,
+        #             radius=self.radius,
+        #             coef=self.coef,
+        #             pare_reverse=True,
+        #             affine_mode=self.affine_mode,
+        #         )
+        #     else: predicted_input_revise = predicted_input
+                
+            # change predicted_base to ae_base, add new_list when interpolate mode is True
+        return (    affine_base,
+                    ae_base,
+                    predicted_input,
+                    ae_coords,
+                    scaler_shear,
+                    rotation,
+                    translation,
+                    adj_mask,
+                    raw_masks,
+                    base_masks,
+                    full_imp, 
+                ), (
+                    pv_embedding, 
+                    pv_pred,
+                    mask_loss, 
+                    mask_thresh, 
+                num_pxs)
+
+
+        
 def make_model_fn(
     device,
     learning_rate=3e-5,
@@ -1046,9 +1470,12 @@ def make_model_fn(
         affine_mode,
     ).to(device)
 
-    decoder = Decoder(de_original_step_size, up_list, conv_size, device, num_base).to(
-        device
-    )
+    decoder = Decoder(de_original_step_size, 
+                      up_list, 
+                      conv_size, 
+                      device, 
+                      num_base
+                    ).to(device)
 
     join = Joint(
         encoder, decoder, device, radius, coef, interpolate_mode, affine_mode
@@ -1059,3 +1486,12 @@ def make_model_fn(
     join = torch.nn.parallel.DataParallel(join)
 
     return encoder, decoder, join, optimizer
+
+                
+
+def imshow_tensor(x,title='show'):
+    import matplotlib.pyplot as plt
+    plt.imshow(x.detach().cpu().numpy());
+    plt.colorbar()
+    plt.title(title)
+    plt.show()

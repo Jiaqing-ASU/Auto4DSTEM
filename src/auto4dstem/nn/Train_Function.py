@@ -324,7 +324,7 @@ class TrainClass:
             torch.cuda.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
             
-         # create folder directory to save weight
+        # create folder directory to save weight
         make_folder(folder_path)
         
         # learning rate for training

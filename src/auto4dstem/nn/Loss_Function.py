@@ -47,7 +47,7 @@ class AcumulatedLoss:
 
     def __post_init__(self):
         
-        print("")
+        print("initialized")
     def __call__(
         self,
         model,

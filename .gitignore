@@ -52,3 +52,7 @@ MANIFEST
 .venv*/
 .conda*/
 .python-version
+
+# Xinqiao messing around
+./src/auto4dstem/nn/drafts
+./Auto4DSTEM/Needle_4
