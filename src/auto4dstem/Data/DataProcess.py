@@ -8,7 +8,7 @@ import argparse
 import logging
 import sys
 
-from auto4dstem import __version__
+from .. import __version__
 
 __author__ = "Shuyu Qin, Joshua Agar"
 __copyright__ = "Joshua Agar"
