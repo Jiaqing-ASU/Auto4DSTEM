@@ -52,3 +52,6 @@ MANIFEST
 .venv*/
 .conda*/
 .python-version
+
+# large file folders
+Extremely_Noisy_4DSTEM_Strain_Mapping_Using_CC_ST_AE_Simulated/*
