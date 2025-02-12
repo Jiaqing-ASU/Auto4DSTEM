@@ -20,6 +20,7 @@ from .Loss_Function import AcumulatedLoss
 from dataclasses import dataclass, field
 from m3util.util.IO import make_folder
 from m3util.viz.text import labelfigs
+import pickle
 
 @dataclass
 class TrainClass:
@@ -467,35 +468,58 @@ class TrainClass:
         return loss_fuc
 
     def load_pretrained_weight(self, weight_path):
-        """function used to load pretrained weight to neural network
-
-        Args:
-            weight_path (string): dictionary of pretrained weight
-
-        Returns:
-            torch.Module: pytorch model with pretrained weight loaded
-        """
-
-        # resets the model
-        encoder, decoder, join, optimizer = self.reset_model()
-
-        # load the pretrained weight
-        if self.device == torch.device("cpu"):
-            check_ccc = torch.load(weight_path, map_location=self.device)
+        """Load pretrained weights with support for DataParallel models"""
+        # First make sure model is initialized
+        if self.join is None:
+            self.encoder, self.decoder, self.join, self.optimizer = self.reset_model()
+        
+        # Load state dict
+        if weight_path.endswith('.pkl'):
+            try:
+                # First try loading with torch
+                checkpoint = torch.load(weight_path, map_location=self.device)
+            except:
+                # If that fails, try loading with pickle and extract the state dict
+                with open(weight_path, 'rb') as f:
+                    checkpoint = pickle.load(f)
         else:
-            check_ccc = torch.load(weight_path)
-
-        # load the pretrained weight to model
-        join.load_state_dict(check_ccc["net"])
-        encoder.load_state_dict(check_ccc["encoder"])
-        decoder.load_state_dict(check_ccc["decoder"])
-        optimizer.load_state_dict(check_ccc["optimizer"])
-
-        # initial model in training class
-        self.join = join
-        self.encoder = encoder
-        self.decoder = decoder
-        self.optimizer = optimizer
+            checkpoint = torch.load(weight_path, map_location=self.device)
+        
+        # Extract state dict from checkpoint
+        if isinstance(checkpoint, dict):
+            if "net" in checkpoint:
+                state_dict = checkpoint["net"]
+                # Also load encoder and decoder if available
+                if "encoder" in checkpoint:
+                    self.encoder.load_state_dict(checkpoint["encoder"])
+                if "decoder" in checkpoint:
+                    self.decoder.load_state_dict(checkpoint["decoder"])
+            elif "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+            else:
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+        
+        # Handle DataParallel models by removing 'module.' prefix if needed
+        if isinstance(self.join, torch.nn.DataParallel):
+            # Model is wrapped in DataParallel but weights might not have 'module.' prefix
+            if not all(k.startswith('module.') for k in state_dict.keys()):
+                state_dict = {'module.' + k: v for k, v in state_dict.items()}
+        else:
+            # Model is not wrapped in DataParallel but weights might have 'module.' prefix
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        # Load the weights
+        try:
+            self.join.load_state_dict(state_dict, strict=False)
+            print("Successfully loaded pretrained weights")
+        except Exception as e:
+            print(f"Warning: Error loading pretrained weights: {e}")
+            # If loading fails, try to reinitialize the model
+            print("Attempting to reinitialize model...")
+            self.encoder, self.decoder, self.join, self.optimizer = self.reset_model()
+            self.join.load_state_dict(state_dict, strict=False)
 
     def show_pickup_dots(
         self,
@@ -689,171 +713,106 @@ class TrainClass:
                 f"{self.folder_path}/{file_name}_show_affine_process_of_pickup_samples.svg"
             )
 
-    def predict(
-        self,
-        sample_index=None,
-        train_process="1",
-        save_strain=False,
-        save_rotation=False,
-        save_translation=False,
-        save_classification=False,
-        save_base=False,
-        file_name="",
-        num_workers=0,
-    ):
-        """function to predict and save results
-
-        Args:
-            sample_index (np.array, optional): 1-D array of index of input dataset if exists. Defaults to None.
-            train_process (str, optional): determine the training process of prediction. Defaults to '1'.
-            save_strain (bool, optional): determine if strain weights saved. Defaults to False.
-            save_rotation (bool, optional): determine if rotation weights saved. Defaults to False.
-            save_translation (bool, optional): determine if translation weights saved. Defaults to False.
-            save_classification (bool, optional): determine if classification weights saved. Defaults to False.
-            save_base (bool, optional): determine if generated base weights saved. Defaults to False.
-            file_name (float/int/str, optional): set the initial of file name. Defaults to ''.
-            num_workers (int, optional): set number of workers in dataloader. Defaults to 0.
-        """
-        # create sample index for reproducing results
+    def predict(self, sample_index=None, train_process="1", save_strain=False, save_rotation=False, 
+               save_translation=False, save_classification=False, save_base=False, file_name="", num_workers=0):
+        """function to predict and save results"""
+        
+        # Ensure model is in eval mode
+        self.join.eval()
+        if hasattr(self, 'encoder'):
+            self.encoder.eval()
+        if hasattr(self, 'decoder'):
+            self.decoder.eval()
+        
+        # Create sample index for reproducing results
         if sample_index is None:
-            # if sample index is None, include all index into sample index
             sample_index = np.arange(len(self.data_set))
-        # determine which results should be reproduced
+        
+        # Determine which results should be reproduced
         if train_process == "1":
-            # load dataset into dataloader
-            data_iterator = DataLoader(
-                self.data_set[sample_index],
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-            )
+            dataset = self.data_set[sample_index]
         else:
-            only_sample = [self.rotate_data[i] for i in sample_index]
-            data_iterator = DataLoader(
-                only_sample,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-            )
+            dataset = [self.rotate_data[i] for i in sample_index]
+        
+        # Configure DataLoader
+        data_iterator = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True if self.device.type == 'cuda' else False
+        )
 
-        # create infrastructure to load trained weights, include rotation, strain, translation and classification
-        rotation = np.zeros([len(self.data_set[sample_index]), 2])
-        scale_shear = np.zeros([len(self.data_set[sample_index]), 4])
-        translation = np.zeros([len(self.data_set[sample_index]), 2])
-        select_k = np.zeros([len(self.data_set[sample_index]), self.num_base])
+        # Initialize arrays on CPU
+        rotation = np.zeros([len(sample_index), 2])
+        scale_shear = np.zeros([len(sample_index), 4])
+        translation = np.zeros([len(sample_index), 2])
+        select_k = np.zeros([len(sample_index), self.num_base])
 
-        # predict weights with pretrained model
-        for i, x_value in enumerate(
-            tqdm(data_iterator, leave=True, total=len(data_iterator))
-        ):
-            with torch.no_grad():
-                # determine x and y based on training process
-                if train_process == "1":
-                    x = x_value.to(self.device, dtype=torch.float)
-                    y = None
-                else:
-                    x, y = x_value
-                    x = x.to(self.device, dtype=torch.float)
-                    y = y.to(self.device, dtype=torch.float)
+        try:
+            # Predict weights with pretrained model
+            for i, x_value in enumerate(tqdm(data_iterator, leave=True, total=len(data_iterator))):
+                torch.cuda.empty_cache()  # Clear cache at start of each iteration
+                
+                with torch.no_grad():
+                    if train_process == "1":
+                        x = x_value.to(self.device, dtype=torch.float)
+                        y = None
+                    else:
+                        x, y = x_value
+                        x = x.to(self.device, dtype=torch.float)
+                        y = y.to(self.device, dtype=torch.float) if y is not None else None
 
-                # determine the number of input based on interpolate mode, predict results.
-                if self.interpolate:
-                    (
-                        predicted_x,
-                        predicted_base,
-                        predicted_input,
-                        kout,
-                        theta_1,
-                        theta_2,
-                        theta_3,
-                        adj_mask,
-                        new_list,
-                        x_inp,
-                    ) = self.join(x, y)
-                # determine the number of input based on interpolate mode, predict results.
-                else:
-                    (
-                        predicted_x,
-                        predicted_base,
-                        predicted_input,
-                        kout,
-                        theta_1,
-                        theta_2,
-                        theta_3,
-                        adj_mask,
-                        new_list,
-                    ) = self.join(x, y)
+                    # Forward pass
+                    if self.interpolate:
+                        outputs = self.join(x, y)
+                        predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list, x_inp = outputs
+                    else:
+                        outputs = self.join(x, y)
+                        predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list = outputs
 
-                # save weights into infrastructure
-                if x.shape[0] == self.batch_size:
+                    # Move results to CPU and convert to numpy immediately
+                    start_idx = i * self.batch_size
+                    end_idx = min((i + 1) * self.batch_size, len(sample_index))
+                    
+                    # Process tensors immediately and clear from GPU
+                    scale_shear[start_idx:end_idx] = theta_1[:, :, 0:2].cpu().numpy().reshape(-1, 4)
+                    rotation[start_idx:end_idx] = theta_2[:, :, 0].cpu().numpy()
+                    translation[start_idx:end_idx] = theta_3[:, :, 2].cpu().numpy()
+                    select_k[start_idx:end_idx] = kout.cpu().numpy().reshape(-1, self.num_base)
 
-                    scale_shear[i * self.batch_size : (i + 1) * self.batch_size] = (
-                        theta_1[:, :, 0:2].cpu().detach().numpy().reshape(-1, 4)
-                    )
-                    rotation[i * self.batch_size : (i + 1) * self.batch_size] = (
-                        theta_2[:, :, 0].cpu().detach().numpy()
-                    )
-                    translation[i * self.batch_size : (i + 1) * self.batch_size] = (
-                        theta_3[:, :, 2].cpu().detach().numpy()
-                    )
-                    select_k[i * self.batch_size : (i + 1) * self.batch_size] = (
-                        kout.cpu().detach().numpy().reshape(-1, self.num_base)
-                    )
-                # save weights into infrastructure
-                else:
-                    scale_shear[i * self.batch_size :] = (
-                        theta_1[:, :, 0:2].cpu().detach().numpy().reshape(-1, 4)
-                    )
-                    rotation[i * self.batch_size :] = (
-                        theta_2[:, :, 0].cpu().detach().numpy()
-                    )
-                    translation[i * self.batch_size :] = (
-                        theta_3[:, :, 2].cpu().detach().numpy()
-                    )
-                    select_k[i * self.batch_size :] = (
-                        kout.cpu().detach().numpy().reshape(-1, self.num_base)
-                    )
+                    # Store base only from the first batch
+                    if i == 0:
+                        self.generated_base = predicted_base[0].cpu().numpy()
 
-        # save weights into public variables to the class
-        self.generated_base = predicted_base[0].cpu().detach().numpy()
-        self.strain_matrix = scale_shear
-        self.rotation_matrix = rotation
-        self.translation_matrix = translation
-        self.classification_matrix = select_k
+                    # Clear variables explicitly
+                    del outputs, predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list
+                    if self.interpolate:
+                        del x_inp
+                
+        finally:
+            # Store results
+            self.strain_matrix = scale_shear
+            self.rotation_matrix = rotation
+            self.translation_matrix = translation
+            self.classification_matrix = select_k
 
-        # set file name according to insert
-        if type(file_name) == float or type(file_name) == int:
-            file_name = format(int(file_name * 100), "02d") + "Per"
-        file_name += f"_{train_process}_train_process"
+            # Save results if requested
+            if type(file_name) == float or type(file_name) == int:
+                file_name = format(int(file_name * 100), "02d") + "Per"
+            file_name += f"_{train_process}_train_process"
 
-        # save strain if mode is on
-        if save_strain:
-            np.save(
-                f"{self.folder_path}/{file_name}_scale_shear.npy", self.strain_matrix
-            )
-        # save rotation if mode is on
-        if save_rotation:
-            np.save(
-                f"{self.folder_path}/{file_name}_rotation.npy", self.rotation_matrix
-            )
-        # save translation if mode is on
-        if save_translation:
-            np.save(
-                f"{self.folder_path}/{file_name}_translation.npy",
-                self.translation_matrix,
-            )
-        # save classification if mode is on
-        if save_classification:
-            np.save(
-                f"{self.folder_path}/{file_name}_classification.npy",
-                self.classification_matrix,
-            )
-        # save generated base if mode is on
-        if save_base:
-            np.save(
-                f"{self.folder_path}/{file_name}_generated_base.npy",
-                self.generated_base,
-            )
+            # Save files
+            if save_strain:
+                np.save(f"{self.folder_path}/{file_name}_scale_shear.npy", self.strain_matrix)
+            if save_rotation:
+                np.save(f"{self.folder_path}/{file_name}_rotation.npy", self.rotation_matrix)
+            if save_translation:
+                np.save(f"{self.folder_path}/{file_name}_translation.npy", self.translation_matrix)
+            if save_classification:
+                np.save(f"{self.folder_path}/{file_name}_classification.npy", self.classification_matrix)
+            if save_base:
+                np.save(f"{self.folder_path}/{file_name}_generated_base.npy", self.generated_base)
 
     def save_predict(
         self,
@@ -1137,3 +1096,183 @@ class TrainClass:
             # update learning rate according to lr_scheduler
             if lr_scheduler is not None:
                 lr_scheduler.step()
+
+    def get_model_weights_as_vector(self):
+        """Flatten all model parameters into a single vector"""
+        return torch.cat([p.data.view(-1) for p in self.join.parameters()])
+    
+    def set_model_weights_from_vector(self, weight_vector):
+        """Set model parameters from a flattened vector"""
+        pointer = 0
+        for p in self.join.parameters():
+            num_params = p.numel()
+            p.data = weight_vector[pointer:pointer + num_params].view(p.shape)
+            pointer += num_params
+            
+    def compute_loss_landscape(self, 
+                             distance=1.0,
+                             n_points=20,
+                             data_subset_size=100,
+                             normalization='filter'):
+        """Compute 2D loss landscape using random orthogonal directions
+        
+        Args:
+            distance (float): Maximum distance in parameter space from start point
+            n_points (int): Number of points to evaluate in each direction
+            data_subset_size (int): Number of samples to use for loss computation
+            normalization (str): How to normalize direction vectors ('filter', 'layer', 'model', or None)
+        
+        Returns:
+            tuple: (loss_surface, x_coordinates, y_coordinates)
+        """
+        # Ensure model is in eval mode
+        self.join.eval()
+        
+        # Get starting parameters
+        start_point = self.get_model_weights_as_vector().to(self.device, dtype=torch.float32)
+        
+        # Generate two random orthogonal directions
+        dir_one = torch.randn_like(start_point)
+        dir_two = torch.randn_like(start_point)
+        # Make dir_two orthogonal to dir_one
+        dir_two = dir_two - (dir_two @ dir_one) * dir_one / (dir_one @ dir_one)
+        
+        # Normalize directions based on specified method
+        if normalization == 'model':
+            dir_one = dir_one / dir_one.norm()
+            dir_two = dir_two / dir_two.norm()
+        elif normalization == 'filter':
+            # Normalize each filter/layer independently
+            start_idx = 0
+            for p in self.join.parameters():
+                param_size = p.numel()
+                dir_one[start_idx:start_idx + param_size] /= dir_one[start_idx:start_idx + param_size].norm()
+                dir_two[start_idx:start_idx + param_size] /= dir_two[start_idx:start_idx + param_size].norm()
+                start_idx += param_size
+        
+        # Scale directions by distance and steps
+        model_norm = start_point.norm()
+        dir_one = dir_one * ((model_norm * distance) / n_points) / dir_one.norm()
+        dir_two = dir_two * ((model_norm * distance) / n_points) / dir_two.norm()
+        
+        # Move start point to corner of grid
+        dir_one = dir_one * (n_points / 2)
+        dir_two = dir_two * (n_points / 2)
+        start_point = start_point - dir_one - dir_two
+        dir_one = dir_one / (n_points / 2)
+        dir_two = dir_two / (n_points / 2)
+        
+        # Create evaluation dataset
+        if self.dynamic_mask_region:
+            subset_indices = torch.randperm(len(self.rotate_data))[:data_subset_size]
+            eval_data = [self.rotate_data[i] for i in subset_indices]
+        else:
+            subset_indices = torch.randperm(len(self.data_set))[:data_subset_size]
+            eval_data = self.data_set[subset_indices]
+        
+        eval_loader = DataLoader(
+            eval_data, 
+            batch_size=self.batch_size, 
+            shuffle=False,
+            pin_memory=True if self.device.type == 'cuda' else False,
+            num_workers=4 if self.device.type == 'cuda' else 0
+        )
+        
+        # Initialize loss function
+        loss_func = AcumulatedLoss(
+            device=self.device,
+            reg_coef=self.reg_coef,
+            scale_coef=self.scale_coef,
+            shear_coef=self.shear_coef,
+            mask_list=self.fixed_mask,
+            weighted_mse=self.weighted_mse,
+            interpolate=self.interpolate,
+            batch_para=self.batch_para,
+            cycle_consistent=self.cycle_consistent,
+            dynamic_mask_region=self.dynamic_mask_region
+        )
+        
+        # Store original weights
+        original_weights = start_point.clone()
+        
+        # Initialize loss surface
+        loss_surface = torch.zeros((n_points, n_points), device=self.device)
+        
+        try:
+            # Compute loss landscape
+            with torch.no_grad():
+                current_point = start_point.clone()
+                for i in range(n_points):
+                    for j in range(n_points):
+                        # For alternating columns, reverse direction to optimize computation
+                        if i % 2 == 0:
+                            self.set_model_weights_from_vector(current_point)
+                            batch_losses = []
+                            for batch in eval_loader:
+                                if isinstance(batch, list):
+                                    x, y = batch
+                                    x = x.to(self.device, dtype=torch.float32)
+                                    y = y.to(self.device, dtype=torch.float32) if y is not None else None
+                                else:
+                                    x = batch.to(self.device, dtype=torch.float32)
+                                    y = None
+                                
+                                outputs = self.join(x, y)
+                                if self.interpolate:
+                                    predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list, x_inp = outputs
+                                else:
+                                    predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list = outputs
+                                
+                                batch_loss = loss_func.compute_loss_only(
+                                    predicted_x, predicted_base, predicted_input,
+                                    kout, theta_1, theta_2, theta_3,
+                                    x, new_list if self.dynamic_mask_region else None
+                                )
+                                batch_losses.append(batch_loss)
+                                
+                            loss_surface[i, j] = torch.stack(batch_losses).mean()
+                            current_point.add_(dir_two)
+                        else:
+                            # Reverse direction for odd-numbered columns
+                            current_point.sub_(dir_two)
+                            self.set_model_weights_from_vector(current_point)
+                            batch_losses = []
+                            for batch in eval_loader:
+                                if isinstance(batch, list):
+                                    x, y = batch
+                                    x = x.to(self.device, dtype=torch.float32)
+                                    y = y.to(self.device, dtype=torch.float32) if y is not None else None
+                                else:
+                                    x = batch.to(self.device, dtype=torch.float32)
+                                    y = None
+                                
+                                outputs = self.join(x, y)
+                                if self.interpolate:
+                                    predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list, x_inp = outputs
+                                else:
+                                    predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, theta_3, adj_mask, new_list = outputs
+                                
+                                batch_loss = loss_func.compute_loss_only(
+                                    predicted_x, predicted_base, predicted_input,
+                                    kout, theta_1, theta_2, theta_3,
+                                    x, new_list if self.dynamic_mask_region else None
+                                )
+                                batch_losses.append(batch_loss)
+                                
+                            loss_surface[i, n_points-j-1] = torch.stack(batch_losses).mean()
+                    
+                    current_point.add_(dir_one)
+                    
+                    # Clear cache periodically
+                    if i % 2 == 0:
+                        torch.cuda.empty_cache()
+        
+        finally:
+            # Restore original weights
+            self.set_model_weights_from_vector(original_weights)
+        
+        # Generate coordinate grids for plotting
+        x_coordinates = torch.linspace(-distance, distance, n_points).cpu().numpy()
+        y_coordinates = torch.linspace(-distance, distance, n_points).cpu().numpy()
+        
+        return loss_surface.cpu().numpy(), x_coordinates, y_coordinates

@@ -300,49 +300,81 @@ class AcumulatedLoss:
         initial_loss,
         con_div=15,
     ):
-        """function for computing loss with dynamic mask region
-
-        Args:
-            x (torch.tensor): torch.tensor format image
-            predicted_x (torch.tensor): torch.tensor format image
-            predicted_base (torch.tensor): torch.tensor format image
-            predicted_input (torch.tensor): torch.tensor format image
-            new_list (list of tensor): The list of tensor with binary type
-            initial_loss (float): loss value before going to the function
-            con_div (int): set the value of parameter divided by loss value. Defaults to 15.
-
-        Returns:
-            float: loss value
-        """
+        """function for computing loss with dynamic mask region"""
         # multiply number of mask on initial loss 
         loss = len(self.mask_list) * initial_loss
 
         for i, mask in enumerate(self.mask_list):
-        # calculate MSE 
+            # Upsample mask if needed to match predicted tensor dimensions
+            if mask.shape != predicted_base.shape[2:]:
+                mask = F.interpolate(
+                    mask.float().unsqueeze(0).unsqueeze(0),
+                    size=predicted_base.shape[2:],
+                    mode='nearest'
+                ).squeeze().bool().to(predicted_base.device)
+            
+            # calculate MSE 
             if self.cycle_consistent:
                 loss += F.mse_loss(
                     predicted_base.squeeze(1)[:, mask],
                     predicted_x.squeeze(1)[:, mask],
                     reduction="mean",
                 )
+            
             # set the loss for the generated input and input
             sub_loss = 0
             for k in range(x.shape[0]):
+                # Get shapes for debugging
+                pred_shape = predicted_input[k].squeeze().shape
+                x_shape = x[k].squeeze().shape
+                
+                # Ensure new_list mask matches input dimensions
+                current_mask = new_list[i][k]
+                target_shape = pred_shape  # Use predicted shape as target
+                
+                if current_mask.shape != target_shape:
+                    current_mask = F.interpolate(
+                        current_mask.float().unsqueeze(0).unsqueeze(0),
+                        size=target_shape,
+                        mode='nearest'
+                    ).squeeze().bool().to(predicted_input.device)
+                
+                # Ensure predicted_input and x are also the same size
+                current_x = x[k].squeeze()
+                if current_x.shape != target_shape:
+                    current_x = F.interpolate(
+                        current_x.unsqueeze(0).unsqueeze(0),
+                        size=target_shape,
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze()
+                
+                current_pred = predicted_input[k].squeeze()
+                
+                # Now compute the loss with matched dimensions
                 sub_loss += F.mse_loss(
-                    predicted_input[k].squeeze()[new_list[i][k]],
-                    x[k].squeeze()[new_list[i][k]],
+                    current_pred[current_mask],
+                    current_x[current_mask],
                     reduction="mean",
                 )
 
             loss += sub_loss / x.shape[0]
         
-        # decrease loss by dividing a constant value to make step size smaller, especially when mask region extremely small
+        # decrease loss by dividing a constant value
         loss = loss / (len(self.mask_list) * con_div)
 
         if loss > self.soft_threshold:
             loss = len(self.mask_list) * initial_loss
 
             for i, mask in enumerate(self.mask_list):
+                # Upsample mask if needed
+                if mask.shape != predicted_base.shape[2:]:
+                    mask = F.interpolate(
+                        mask.float().unsqueeze(0).unsqueeze(0),
+                        size=predicted_base.shape[2:],
+                        mode='nearest'
+                    ).squeeze().bool().to(predicted_base.device)
+                
                 if self.cycle_consistent:
                     loss += F.l1_loss(
                         predicted_base.squeeze(1)[:, mask],
@@ -352,21 +384,80 @@ class AcumulatedLoss:
 
                 # set the loss for the generated input and input
                 sub_loss = 0
-
                 for k in range(x.shape[0]):
+                    # Get target shape from predicted input
+                    target_shape = predicted_input[k].squeeze().shape
+                    
+                    # Ensure new_list mask matches target dimensions
+                    current_mask = new_list[i][k]
+                    if current_mask.shape != target_shape:
+                        current_mask = F.interpolate(
+                            current_mask.float().unsqueeze(0).unsqueeze(0),
+                            size=target_shape,
+                            mode='nearest'
+                        ).squeeze().bool().to(predicted_input.device)
+                    
+                    # Ensure x is also the right size
+                    current_x = x[k].squeeze()
+                    if current_x.shape != target_shape:
+                        current_x = F.interpolate(
+                            current_x.unsqueeze(0).unsqueeze(0),
+                            size=target_shape,
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze()
+                    
+                    current_pred = predicted_input[k].squeeze()
+                    
                     sub_loss += F.l1_loss(
-                        predicted_input[k].squeeze()[new_list[i][k]],
-                        x[k].squeeze()[new_list[i][k]],
+                        current_pred[current_mask],
+                        current_x[current_mask],
                         reduction="mean",
                     )
 
                 loss += sub_loss / x.shape[0]
 
             loss = loss / (len(self.mask_list) * con_div)
-
             loss -= 1
 
         if loss > self.hard_threshold:
             loss = initial_loss + self.hard_threshold
 
         return loss
+
+    def compute_loss_only(self, predicted_x, predicted_base, predicted_input, 
+                         kout, theta_1, theta_2, theta_3, x, new_list=None):
+        """Compute loss without gradients or optimization"""
+        # Calculate l norm from generated base 
+        l2_loss = self.reg_coef * torch.norm(predicted_base, p=self.norm_order) / x.shape[0]
+        
+        # Calculate scale penalty
+        scale_loss = self.scale_coef * (
+            torch.mean(F.relu(abs(theta_1[:, 0, 0] - 1) - self.scale_penalty))
+            + torch.mean(F.relu(abs(theta_1[:, 1, 1] - 1) - self.scale_penalty))
+        )
+        
+        # Calculate shear penalty
+        shear_loss = self.shear_coef * torch.mean(
+            F.relu(abs(theta_1[:, 0, 1]) - self.shear_penalty)
+        )
+
+        # Add l norm, scale penalty and shear penalty to loss
+        initial_loss = l2_loss + scale_loss + shear_loss
+        
+        if self.dynamic_mask_region:
+            loss = self.dynamic_mask_list(
+                x,
+                predicted_x,
+                predicted_base,
+                predicted_input,
+                new_list,
+                initial_loss,
+                con_div=self.con_div,
+            )
+        else:
+            loss = self.fix_mask_list(
+                x, predicted_x, predicted_base, predicted_input, initial_loss
+            )
+        
+        return loss.detach()  # Return detached tensor
