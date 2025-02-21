@@ -41,10 +41,12 @@ if torch.cuda.is_available():
     print(f"Using GPU: {torch.cuda.get_device_name(0)}")
     n_gpus = torch.cuda.device_count()
     print(f"Number of available GPUs: {n_gpus}")
-    
+
     # Print available GPU memory
     for i in range(n_gpus):
-        free_mem = torch.cuda.get_device_properties(i).total_memory - torch.cuda.memory_allocated(i)
+        free_mem = torch.cuda.get_device_properties(
+            i
+        ).total_memory - torch.cuda.memory_allocated(i)
         print(f"GPU {i} free memory: {free_mem / 1024**3:.1f} GB")
 else:
     device = torch.device("cpu")
@@ -68,7 +70,21 @@ mask_tensor, mask_list = set_mask.mask_ring(radius_1=50, radius_2=85)
 # download_files_from_txt(file_download, folder_name)
 
 print("set BKG level, load data and pretrained weights")
-list_bkg_intensity = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7]
+list_bkg_intensity = [
+    0,
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.35,
+    0.4,
+    0.45,
+    0.5,
+    0.6,
+    0.7,
+]
 
 for bkg_intensity in tqdm(list_bkg_intensity, desc="Processing background intensities"):
     bkg_str = format(int(bkg_intensity * 100), "02d")
@@ -76,7 +92,6 @@ for bkg_intensity in tqdm(list_bkg_intensity, desc="Processing background intens
     rotation_path = f"{folder_name}/{bkg_str}Percent_pretrained_rotation.npy"
 
     print("Initialize the training class from noise-free simulated dataset")
-
 
     # Initialize model with appropriate batch size for GPU memory
     tc = TrainClass(
@@ -112,7 +127,9 @@ for bkg_intensity in tqdm(list_bkg_intensity, desc="Processing background intens
 
     # Load pretrained weights
     print("Loading pretrained weights...")
-    weight_path = f"{folder_name}/{bkg_str}percent_noisy_simulated_4dstem_pretrained_weights.pkl"
+    weight_path = (
+        f"{folder_name}/{bkg_str}percent_noisy_simulated_4dstem_pretrained_weights.pkl"
+    )
     tc.load_pretrained_weight(weight_path)
 
     # Clear GPU cache
@@ -124,18 +141,18 @@ for bkg_intensity in tqdm(list_bkg_intensity, desc="Processing background intens
     # Process predictions
     # print("Processing predictions...")
     # tc.predict(
-    #     train_process="2", 
-    #     save_strain=True, 
-    #     save_rotation=True, 
+    #     train_process="2",
+    #     save_strain=True,
+    #     save_rotation=True,
     #     file_name=bkg_intensity,
     #     num_workers=4
     # )
     torch.cuda.empty_cache()
 
     # tc.predict(
-    #     train_process="2", 
-    #     save_strain=False, 
-    #     save_rotation=False, 
+    #     train_process="2",
+    #     save_strain=False,
+    #     save_rotation=False,
     #     file_name=bkg_intensity,
     #     num_workers=4
     # )
@@ -145,79 +162,101 @@ for bkg_intensity in tqdm(list_bkg_intensity, desc="Processing background intens
     print("Computing loss landscape...")
     try:
         # Define loss landscape parameters
-        ll_distance = 0.75    # Distance parameter
-        ll_points = 50      # Number of points
-        ll_subset = 50      # Subset size
-        
+        ll_distance = 0.75  # Distance parameter
+        ll_points = 50  # Number of points
+        ll_subset = 50  # Subset size
+
         loss_surface, x_coords, y_coords = tc.compute_loss_landscape(
-            distance=ll_distance,    
-            n_points=ll_points,     
-            data_subset_size=ll_subset,  
-            normalization='filter'  
+            distance=ll_distance,
+            n_points=ll_points,
+            data_subset_size=ll_subset,
+            normalization="filter",
         )
-        
+
         # Create directory for plots if it doesn't exist
         plots_dir = os.path.join(folder_name, "loss_landscape_plots")
         os.makedirs(plots_dir, exist_ok=True)
-        
+
         # Create base filename with parameters
         base_filename = f"loss_landscape_bkg{bkg_intensity}_d{ll_distance}_n{ll_points}"
-        plot_title = f"Loss Landscape (bkg={bkg_intensity}, d={ll_distance}, n={ll_points})"
-        
+        plot_title = (
+            f"Loss Landscape (bkg={bkg_intensity}, d={ll_distance}, n={ll_points})"
+        )
+
         # Create 2D contour plot
         plt.figure(figsize=(12, 10))
         x_grid, y_grid = np.meshgrid(x_coords, y_coords)
         contour = plt.contour(x_grid, y_grid, loss_surface, levels=40)
-        plt.colorbar(contour, label='Loss')
-        plt.xlabel('Direction 1')
-        plt.ylabel('Direction 2')
-        plt.title(f'{plot_title} - Contour')
-        plt.plot([0], [0], 'r.', markersize=10, label='Model Position')
+        plt.colorbar(contour, label="Loss")
+        plt.xlabel("Direction 1")
+        plt.ylabel("Direction 2")
+        plt.title(f"{plot_title} - Contour")
+        plt.plot([0], [0], "r.", markersize=10, label="Model Position")
         plt.legend()
-        plt.savefig(os.path.join(plots_dir, f"{base_filename}_contour.svg"), bbox_inches='tight', dpi=300)
+        plt.savefig(
+            os.path.join(plots_dir, f"{base_filename}_contour.svg"),
+            bbox_inches="tight",
+            dpi=300,
+        )
         plt.close()
 
         # Create 3D surface plot
         fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        surf = ax.plot_surface(x_grid, y_grid, loss_surface, cmap='viridis', 
-                            rcount=100, ccount=100)
-        fig.colorbar(surf, label='Loss')
-        ax.set_xlabel('Direction 1')
-        ax.set_ylabel('Direction 2')
-        ax.set_zlabel('Loss')
-        ax.set_title(f'{plot_title} - Surface')
-        ax.scatter([0], [0], [loss_surface[len(loss_surface)//2, len(loss_surface)//2]], 
-                color='red', s=100, label='Model Position')
+        ax = fig.add_subplot(111, projection="3d")
+        surf = ax.plot_surface(
+            x_grid, y_grid, loss_surface, cmap="viridis", rcount=100, ccount=100
+        )
+        fig.colorbar(surf, label="Loss")
+        ax.set_xlabel("Direction 1")
+        ax.set_ylabel("Direction 2")
+        ax.set_zlabel("Loss")
+        ax.set_title(f"{plot_title} - Surface")
+        ax.scatter(
+            [0],
+            [0],
+            [loss_surface[len(loss_surface) // 2, len(loss_surface) // 2]],
+            color="red",
+            s=100,
+            label="Model Position",
+        )
         ax.legend()
-        plt.savefig(os.path.join(plots_dir, f"{base_filename}_3d.svg"), bbox_inches='tight', dpi=300)
+        plt.savefig(
+            os.path.join(plots_dir, f"{base_filename}_3d.svg"),
+            bbox_inches="tight",
+            dpi=300,
+        )
         plt.close()
-        
+
         # Create filled contour plot
         plt.figure(figsize=(12, 10))
-        contourf = plt.contourf(x_grid, y_grid, loss_surface, levels=40, cmap='viridis')
-        plt.colorbar(contourf, label='Loss')
-        plt.xlabel('Direction 1')
-        plt.ylabel('Direction 2')
-        plt.title(f'{plot_title} - Filled Contour')
-        plt.plot([0], [0], 'r.', markersize=10, label='Model Position')
+        contourf = plt.contourf(x_grid, y_grid, loss_surface, levels=40, cmap="viridis")
+        plt.colorbar(contourf, label="Loss")
+        plt.xlabel("Direction 1")
+        plt.ylabel("Direction 2")
+        plt.title(f"{plot_title} - Filled Contour")
+        plt.plot([0], [0], "r.", markersize=10, label="Model Position")
         plt.legend()
-        plt.savefig(os.path.join(plots_dir, f"{base_filename}_filled_contour.svg"), 
-                    bbox_inches='tight', dpi=300)
+        plt.savefig(
+            os.path.join(plots_dir, f"{base_filename}_filled_contour.svg"),
+            bbox_inches="tight",
+            dpi=300,
+        )
         plt.close()
-        
+
         # Save the computed landscape data with parameters in filename
-        np.savez(os.path.join(plots_dir, f"{base_filename}_data.npz"),
-                loss_surface=loss_surface,
-                x_coords=x_coords,
-                y_coords=y_coords,
-                distance=ll_distance,
-                n_points=ll_points,
-                subset_size=ll_subset,
-                background_intensity=bkg_intensity)
-        
+        np.savez(
+            os.path.join(plots_dir, f"{base_filename}_data.npz"),
+            loss_surface=loss_surface,
+            x_coords=x_coords,
+            y_coords=y_coords,
+            distance=ll_distance,
+            n_points=ll_points,
+            subset_size=ll_subset,
+            background_intensity=bkg_intensity,
+        )
+
         print(f"Loss landscape visualization completed. Plots saved in {plots_dir}")
-        
+
     except Exception as e:
         print(f"Error computing loss landscape: {str(e)}")
         raise

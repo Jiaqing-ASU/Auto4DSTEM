@@ -32,9 +32,13 @@ def point(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric) ->
 
 
 # noinspection DuplicatedCode
-def linear_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end: typing.Union[torch.nn.Module, ModelWrapper],
-                         metric: Metric, steps=100, deepcopy_model=False) -> np.ndarray:
+def linear_interpolation(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    steps=100,
+    deepcopy_model=False,
+) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or
     agent along a linear subspace of the parameter space defined by two end points.
@@ -68,8 +72,12 @@ def linear_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
     :return: 1-d array of loss values along the line connecting start and end models
     """
     # create wrappers from deep copies to avoid aliasing if desired
-    model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
-    end_model_wrapper = wrap_model(copy.deepcopy(model_end) if deepcopy_model else model_end)
+    model_start_wrapper = wrap_model(
+        copy.deepcopy(model_start) if deepcopy_model else model_start
+    )
+    end_model_wrapper = wrap_model(
+        copy.deepcopy(model_end) if deepcopy_model else model_end
+    )
 
     start_point = model_start_wrapper.get_module_parameters()
     end_point = end_model_wrapper.get_module_parameters()
@@ -85,8 +93,14 @@ def linear_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
 
 
 # noinspection DuplicatedCode
-def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=0.1, steps=100,
-                normalization='filter', deepcopy_model=False) -> np.ndarray:
+def random_line(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    distance=0.1,
+    steps=100,
+    normalization="filter",
+    deepcopy_model=False,
+) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along a
     linear subspace of the parameter space defined by a start point and a randomly sampled direction.
@@ -125,25 +139,31 @@ def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric
     :return: 1-d array of loss values along the randomly sampled direction
     """
     # create wrappers from deep copies to avoid aliasing if desired
-    model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
+    model_start_wrapper = wrap_model(
+        copy.deepcopy(model_start) if deepcopy_model else model_start
+    )
 
     # obtain start point in parameter space and random direction
     # random direction is randomly sampled, then normalized, and finally scaled by distance/steps
     start_point = model_start_wrapper.get_module_parameters()
     direction = rand_u_like(start_point)
 
-    if normalization == 'model':
+    if normalization == "model":
         direction.model_normalize_(start_point)
-    elif normalization == 'layer':
+    elif normalization == "layer":
         direction.layer_normalize_(start_point)
-    elif normalization == 'filter':
+    elif normalization == "filter":
         direction.filter_normalize_(start_point)
     elif normalization is None:
         pass
     else:
-        raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+        raise AttributeError(
+            "Unsupported normalization argument. Supported values are model, layer, and filter"
+        )
 
-    direction.mul_(((start_point.model_norm() * distance) / steps) / direction.model_norm())
+    direction.mul_(
+        ((start_point.model_norm() * distance) / steps) / direction.model_norm()
+    )
 
     data_values = []
     for i in range(steps):
@@ -155,10 +175,14 @@ def random_line(model_start: typing.Union[torch.nn.Module, ModelWrapper], metric
 
 
 # noinspection DuplicatedCode
-def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end_one: typing.Union[torch.nn.Module, ModelWrapper],
-                         model_end_two: typing.Union[torch.nn.Module, ModelWrapper],
-                         metric: Metric, steps=20, deepcopy_model=False) -> np.ndarray:
+def planar_interpolation(
+    model_start: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end_one: typing.Union[torch.nn.Module, ModelWrapper],
+    model_end_two: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    steps=20,
+    deepcopy_model=False,
+) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along
     a planar subspace of the parameter space defined by a start point and two end points.
@@ -195,9 +219,15 @@ def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
     :param deepcopy_model: indicates whether the method will deepcopy the model(s) to avoid aliasing
     :return: 1-d array of loss values along the line connecting start and end models
     """
-    model_start_wrapper = wrap_model(copy.deepcopy(model_start) if deepcopy_model else model_start)
-    model_end_one_wrapper = wrap_model(copy.deepcopy(model_end_one) if deepcopy_model else model_end_one)
-    model_end_two_wrapper = wrap_model(copy.deepcopy(model_end_two) if deepcopy_model else model_end_two)
+    model_start_wrapper = wrap_model(
+        copy.deepcopy(model_start) if deepcopy_model else model_start
+    )
+    model_end_one_wrapper = wrap_model(
+        copy.deepcopy(model_end_one) if deepcopy_model else model_end_one
+    )
+    model_end_two_wrapper = wrap_model(
+        copy.deepcopy(model_end_two) if deepcopy_model else model_end_two
+    )
 
     # compute direction vectors
     start_point = model_start_wrapper.get_module_parameters()
@@ -229,8 +259,14 @@ def planar_interpolation(model_start: typing.Union[torch.nn.Module, ModelWrapper
 
 
 # noinspection DuplicatedCode
-def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Metric, distance=1, steps=20,
-                 normalization='filter', deepcopy_model=False) -> np.ndarray:
+def random_plane(
+    model: typing.Union[torch.nn.Module, ModelWrapper],
+    metric: Metric,
+    distance=1,
+    steps=20,
+    normalization="filter",
+    deepcopy_model=False,
+) -> np.ndarray:
     """
     Returns the computed value of the evaluation function applied to the model or agent along a planar
     subspace of the parameter space defined by a start point and two randomly sampled directions.
@@ -275,19 +311,21 @@ def random_plane(model: typing.Union[torch.nn.Module, ModelWrapper], metric: Met
     dir_one = rand_u_like(start_point)
     dir_two = orthogonal_to(dir_one)
 
-    if normalization == 'model':
+    if normalization == "model":
         dir_one.model_normalize_(start_point)
         dir_two.model_normalize_(start_point)
-    elif normalization == 'layer':
+    elif normalization == "layer":
         dir_one.layer_normalize_(start_point)
         dir_two.layer_normalize_(start_point)
-    elif normalization == 'filter':
+    elif normalization == "filter":
         dir_one.filter_normalize_(start_point)
         dir_two.filter_normalize_(start_point)
     elif normalization is None:
         pass
     else:
-        raise AttributeError('Unsupported normalization argument. Supported values are model, layer, and filter')
+        raise AttributeError(
+            "Unsupported normalization argument. Supported values are model, layer, and filter"
+        )
 
     # scale to match steps and total distance
     dir_one.mul_(((start_point.model_norm() * distance) / steps) / dir_one.model_norm())
