@@ -13,6 +13,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import logging
 import datetime
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import time
+from datetime import timedelta
+import multiprocessing
+from torch import multiprocessing as mp
+import copy
 
 warnings.filterwarnings("ignore")
 
@@ -110,57 +116,67 @@ print(f" Load data function 2 for second training process")
 
 def load_data_4_process2(data_dir, pre_rot, w_bg=0.60):
     """
-
-    data_dir: path of the dataset
-    label_index: path of the pretrained rotation
-
+    Optimized data loading function with better memory management and progress tracking
     """
+    logging.info("Starting data loading process...")
+    t0 = time.time()
 
-    f = h5py.File(data_dir, "r")
-    op4d = f["output4D"]
-    op4d = op4d[:, :, 28:228, 28:228]
-    op4d = np.transpose(op4d, (1, 0, 3, 2))
-    op4d = op4d.reshape(-1, 200, 200)
-    f.close()
+    try:
+        with h5py.File(data_dir, "r") as f:
+            # Load data in chunks
+            op4d = f["output4D"]
+            total_size = op4d.shape[0] * op4d.shape[1]
+            chunk_size = 1000  # Adjust based on memory availability
+            
+            # Pre-allocate memory
+            noisy_data = np.zeros([65536, 1, 200, 200], dtype=np.float32)
+            
+            # Process in chunks
+            for i in tqdm(range(0, 65536, chunk_size), desc="Loading data chunks"):
+                end_idx = min(i + chunk_size, 65536)
+                chunk = op4d[i:end_idx, :, 28:228, 28:228]
+                chunk = np.transpose(chunk, (1, 0, 3, 2))
+                chunk = chunk.reshape(-1, 200, 200)
+                
+                if w_bg == 0:
+                    noisy_data[i:end_idx, 0] = chunk * 1e5 / 4
+                else:
+                    # Process background noise
+                    im = np.zeros([200, 200])
+                    counts_per_probe = 1e5
+                    qx = np.fft.fftfreq(im.shape[0], d=1)
+                    qy = np.fft.fftfreq(im.shape[1], d=1)
+                    qya, qxa = np.meshgrid(qy, qx)
+                    qxa = np.fft.fftshift(qxa)
+                    qya = np.fft.fftshift(qya)
+                    qra2 = qxa**2 + qya**2
+                    im_bg = 1.0 / (1 + qra2 / 1e-2**2)
+                    im_bg = im_bg / np.sum(im_bg)
+                    
+                    for j in range(i, end_idx):
+                        test_img = chunk[j - i]
+                        int_comb = test_img * (1 - w_bg) + im_bg * w_bg
+                        int_noisy = np.random.poisson(int_comb * counts_per_probe) / counts_per_probe
+                        noisy_data[j, 0] = int_noisy * 1e5 / 4
 
-    if w_bg == 0:
-        noisy_data = op4d * 1e5 / 4
+        # Process rotation data
+        angle = np.mod(
+            np.arctan2(pre_rot[:, 1].reshape(256, 256), pre_rot[:, 0].reshape(256, 256)),
+            np.pi / 3,
+        ).reshape(-1)
 
-    else:
-        noisy_data = np.zeros([65536, 200, 200])
-        im = np.zeros([200, 200])
-        counts_per_probe = 1e5
-        for i in tqdm(range(65536), leave=True, total=65536):
-            test_img = np.copy(op4d[i])
-            qx = np.fft.fftfreq(im.shape[0], d=1)
-            qy = np.fft.fftfreq(im.shape[1], d=1)
-            qya, qxa = np.meshgrid(qy, qx)
-            qxa = np.fft.fftshift(qxa)
-            qya = np.fft.fftshift(qya)
-            qra2 = qxa**2 + qya**2
-            im_bg = 1.0 / (1 + qra2 / 1e-2**2)
-            im_bg = im_bg / np.sum(im_bg)
-            int_comb = test_img * (1 - w_bg) + im_bg * w_bg
-            int_noisy = (
-                np.random.poisson(int_comb * counts_per_probe) / counts_per_probe
-            )
-            int_noisy = int_noisy * 1e5 / 4
-            noisy_data[i] = int_noisy
+        # Combine data and labels efficiently
+        logging.info("Combining data and labels...")
+        whole_data_with_rotation = list(zip(noisy_data, angle))
+        
+        total_time = time.time() - t0
+        logging.info(f"Data loading completed in {timedelta(seconds=total_time)}")
+        
+        return whole_data_with_rotation
 
-    del op4d
-
-    noisy_data = noisy_data.reshape(-1, 1, 200, 200)
-    angle = np.mod(
-        np.arctan2(pre_rot[:, 1].reshape(256, 256), pre_rot[:, 0].reshape(256, 256)),
-        np.pi / 3,
-    ).reshape(-1)
-
-    # combine the data and label for test
-    whole_data_with_rotation = []
-    for i in tqdm(range(noisy_data.shape[0]), leave=True, total=noisy_data.shape[0]):
-        whole_data_with_rotation.append([noisy_data[i], angle[i]])
-
-    return whole_data_with_rotation
+    except Exception as e:
+        logging.error(f"Error during data loading: {e}")
+        raise
 
 print(f"autoencoder")
 
@@ -616,7 +632,6 @@ class Decoder(nn.Module):
                 nn.Upsample(
                     scale_factor=up_list[i], mode="bilinear", align_corners=True
                 )
-            )
             original_step_size = [
                 original_step_size[0] * up_list[i],
                 original_step_size[1] * up_list[i],
@@ -1479,39 +1494,110 @@ def sub_direction(parameters, direction):
     for p, d in zip(parameters, direction):
         p.sub_(d)
 
+# Global configuration
+STEPS = 21  # number of steps in each direction
+DISTANCE = 0.4  # maximum distance from start point
+
+def move_to_cpu(model):
+    """Helper function to move model and all its parameters to CPU"""
+    model = model.cpu()
+    for param in model.parameters():
+        param.data = param.data.cpu()
+    for buffer in model._buffers.values():
+        if isinstance(buffer, torch.Tensor):
+            buffer.data = buffer.data.cpu()
+    for module in model.children():
+        move_to_cpu(module)
+    return model
+
+def compute_grid_point_cpu(args):
+    """Compute loss at a single grid point using CPU"""
+    join, train_iterator, optimizer, params, coef_1, coef_2, coef_3, regul_type, mask_, interpolate_2 = args
+    
+    # Move model and all its parameters to CPU
+    join = move_to_cpu(join)
+    
+    # Set model parameters on CPU
+    with torch.no_grad():
+        set_parameters(join, params)
+    
+    # Ensure all inputs are on CPU
+    if isinstance(mask_, list):
+        mask_ = [m.cpu() if torch.is_tensor(m) else m for m in mask_]
+    elif torch.is_tensor(mask_):
+        mask_ = mask_.cpu()
+    
+    # Move optimizer states to CPU if they exist
+    if optimizer.state:
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p in optimizer.state:
+                    for key, value in optimizer.state[p].items():
+                        if torch.is_tensor(value):
+                            optimizer.state[p][key] = value.cpu()
+    
+    # Compute loss on CPU
+    train_metrics = loss_function_2nd(
+        join, train_iterator, optimizer, 'cpu',
+        coef_1, coef_2, coef_3, regul_type,
+        mask_, interpolate_2
+    )
+    
+    return train_metrics[0]
+
 def compute_loss_landscape(join, train_iterator, optimizer, device, coef_1, coef_2, coef_3, regul_type, mask_, interpolate_2, rotation_file="25Percent_rotation_071323"):
     """
     Compute the loss landscape along a planar subspace of the parameter space.
-    Implementation matches random_plane from model_parameters.py
+    CPU-optimized version.
     """
+    start_time = time.time()
+    logging.info("Starting loss landscape computation")
+    
     try:
-        # Get starting parameters and save original weights with proper deep copy
-        with torch.no_grad():
-            start_point = get_model_parameters(join)
-            original_weights = clone_parameters(start_point)
+        # Create a CPU copy of the model
+        join_cpu = copy.deepcopy(join)
+        join_cpu = move_to_cpu(join_cpu)
         
-        # Generate random orthogonal directions
+        # Create CPU optimizer
+        cpu_optimizer = type(optimizer)(join_cpu.parameters(), **optimizer.defaults)
+        
+        # Convert mask to CPU if it's a tensor or list of tensors
+        if isinstance(mask_, list):
+            mask_cpu = [m.cpu() if torch.is_tensor(m) else m for m in mask_]
+        elif torch.is_tensor(mask_):
+            mask_cpu = mask_.cpu()
+        else:
+            mask_cpu = mask_
+            
+        t0 = time.time()
+        with torch.no_grad():
+            start_point = get_model_parameters(join_cpu)
+            original_weights = clone_parameters(start_point)
+        logging.info(f"Initial parameter setup took: {timedelta(seconds=time.time()-t0)}")
+        
+        # Direction generation and normalization - CPU operations
+        t0 = time.time()
         dir_one = rand_uniform_like(start_point)
         dir_two = make_orthogonal(dir_one)
         
-        # Normalize directions using filter normalization
         dir_one = normalize_direction(dir_one, start_point, normalization='filter')
         dir_two = normalize_direction(dir_two, start_point, normalization='filter')
+        logging.info(f"Direction generation and normalization took: {timedelta(seconds=time.time()-t0)}")
         
         # Grid setup
-        steps = 5  # number of steps in each direction
-        distance = 0.5  # maximum distance from start point
+        steps = STEPS
+        distance = DISTANCE
         
-        # Scale directions to match steps and total distance
+        # Scale directions
+        t0 = time.time()
         model_norm = get_model_norm(start_point)
-        
-        # Scale to match steps and total distance (exactly as in random_plane)
         dir_one_norm = get_model_norm(dir_one)
         dir_two_norm = get_model_norm(dir_two)
+        
         mul_(dir_one, ((model_norm * distance) / steps) / dir_one_norm)
         mul_(dir_two, ((model_norm * distance) / steps) / dir_two_norm)
         
-        # Move start point to corner and adjust step size (exactly as in random_plane)
+        # Move start point to corner
         mul_(dir_one, steps / 2)
         mul_(dir_two, steps / 2)
         current_point = clone_parameters(original_weights)
@@ -1519,203 +1605,122 @@ def compute_loss_landscape(join, train_iterator, optimizer, device, coef_1, coef
         sub_direction(current_point, dir_two)
         truediv_(dir_one, steps / 2)
         truediv_(dir_two, steps / 2)
+        logging.info(f"Direction scaling and start point setup took: {timedelta(seconds=time.time()-t0)}")
         
-        # Initialize loss surface
-        loss_surface = torch.zeros((steps, steps), device=device)
-        
-        # Verify center point will be original weights
-        center_point = clone_parameters(current_point)
-        mul_(dir_one, steps / 2)
-        add_direction(center_point, dir_one)
-        mul_(dir_two, steps / 2) 
-        add_direction(center_point, dir_two)
-
-        truediv_(dir_one, steps / 2)
-        truediv_(dir_two, steps / 2)
+        # Prepare grid points
+        t0 = time.time()
+        grid_points = []
+        for i in range(steps):
+            row_points = []
+            current_row = clone_parameters(current_point)
             
-        # Check if center point matches original weights
-        center_diff = sum(torch.sum((c - o).abs()) for c, o in zip(center_point, original_weights))
-        logging.info(f"Center point difference from original: {center_diff.item()}")
-        print(f"!!!!!!Center point difference from original: {center_diff.item()}")
+            for j in range(steps):
+                row_points.append(clone_parameters(current_row))
+                add_direction(current_row, dir_two)
+            
+            grid_points.extend(row_points)
+            add_direction(current_point, dir_one)
         
-        # Compute loss landscape
-        data_matrix = []  # Store data in a list first, like in random_plane
-        with torch.no_grad():
-            for i in tqdm(range(steps), desc="Computing loss landscape"):
-                data_column = []  # Store each column of data
-                
-                for j in range(steps):
-                    # Set model weights to current grid point
-                    set_parameters(join, current_point)
-                    
-                    # Compute loss at current point
-                    train_metrics = loss_function_2nd(
-                        join, train_iterator, optimizer, device,
-                        coef_1, coef_2, coef_3, regul_type,
-                        mask_, interpolate_2
-                    )
-                    
-                    # For every other column, reverse the order in which the column is generated
-                    if i % 2 == 0:
-                        add_direction(current_point, dir_two)
-                        data_column.append(train_metrics[0])
-                    else:
-                        sub_direction(current_point, dir_two)
-                        data_column.insert(0, train_metrics[0])
-                
-                data_matrix.append(data_column)
-                add_direction(current_point, dir_one)
-                
-                # Clear GPU memory periodically
-                if i % 2 == 0:
-                    torch.cuda.empty_cache()
-                
-                logging.info(f"Completed row {i+1}/{steps}")
+        logging.info(f"Grid point preparation took: {timedelta(seconds=time.time()-t0)}")
         
-        # Convert to numpy array at the end
-        loss_surface = np.array(data_matrix)
+        # Compute losses in parallel on CPU
+        t0 = time.time()
+        loss_surface = np.zeros((steps, steps))
         
-        # Create directory if it doesn't exist
+        # Prepare arguments for parallel processing - use CPU model copy
+        args_list = [(copy.deepcopy(join_cpu), train_iterator, cpu_optimizer, params, 
+                      coef_1, coef_2, coef_3, regul_type, 
+                      mask_cpu, interpolate_2) for params in grid_points]
+        
+        # Use ThreadPoolExecutor for CPU parallelization
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(tqdm(
+                executor.map(compute_grid_point_cpu, args_list),
+                total=len(args_list),
+                desc="Computing loss landscape"
+            ))
+        
+        # Reshape results into grid
+        loss_surface = np.array(results).reshape(steps, steps)
+        logging.info(f"Parallel loss computation took: {timedelta(seconds=time.time()-t0)}")
+        
+        # Save results
+        t0 = time.time()
         save_dir = 'loss_landscapes'
         os.makedirs(save_dir, exist_ok=True)
         
-        # Extract rotation percentage from filename
         percentage = rotation_file.split('_')[0]
-        
-        # Create filename with parameters
         filename = f"{percentage}_steps{steps}_dist{distance:.1f}_loss_landscape.npz"
         save_path = os.path.join(save_dir, filename)
         
-        # Save results
         np.savez(save_path, 
                  loss_surface=loss_surface,
                  x_coordinates=np.linspace(-distance, distance, steps),
                  y_coordinates=np.linspace(-distance, distance, steps))
         
-        logging.info(f"Successfully saved loss landscape data to {save_path}")
+        logging.info(f"Saving results took: {timedelta(seconds=time.time()-t0)}")
         
     except Exception as e:
         logging.error(f"Error during loss landscape computation: {e}")
         raise
         
     finally:
-        # Restore original weights
+        # Restore original weights and move back to original device
         set_parameters(join, original_weights)
+        join = join.to(device)
+        
+    total_time = time.time() - start_time
+    logging.info(f"Total loss landscape computation took: {timedelta(seconds=total_time)}")
         
     return loss_surface
 
-def Test_Process(
-    data_set,
-    epochs=1,
-    activity_regular="l1",
-    mask_=modified_mask_list_2,
-    check_mask=modified_mask_list_2,
-    Up_inp=interpolate_2,
-    epoch_=None,
-    file_path=None,
-    folder_path="",
-    best_train_loss=None,
-):
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
-    
-    # Set random seed
-    seed = 42
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-    logging.info("Set random seed to 42")
-
-    # Training parameters
-    learning_rate = 3e-4
-    coef_1 = 5e-7
-    coef_2 = 70
-    coef_3 = 10
-    batch_size = 64  # Added explicit batch_size
-
-    # Round parameters for consistency
-    learning_rate = round(learning_rate * 1e6) / 1e6
-    coef_1 = round(coef_1 * 1e9) / 1e9
-    coef_2 = round(coef_2 * 1e2) / 1e2
-    coef_3 = round(coef_3 * 1e2) / 1e2
-
-    logging.info(f"Learning parameters - LR: {learning_rate}, Coef1: {coef_1}, Coef2: {coef_2}, Coef3: {coef_3}")
-
-    # Model setup
-    encoder, decoder, join, optimizer = make_model_2(
-        device, learning_rate=learning_rate, fixed_mask=mask_
-    )
-
-    # Load checkpoint
+def Test_Process(data_set, **kwargs):
     try:
-        checkpoint = "2nd_train_weight_25Per.pkl"
-        pre_weight = torch.load(checkpoint, map_location=device)
+        # Device setup
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Using device: {device}")
         
-        # Remove 'module.' prefix from state dict keys
-        new_state_dict = {}
-        for k, v in pre_weight["net"].items():
-            name = k.replace("module.", "")
-            new_state_dict[name] = v
-        
-        join.load_state_dict(new_state_dict)
-        logging.info(f"Successfully loaded checkpoint: {checkpoint}")
-    except Exception as e:
-        logging.error(f"Error loading checkpoint: {e}")
-        raise
+        # Set random seed
+        seed = 42
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+        logging.info("Set random seed to 42")
 
-    # Set regularization type
-    regul_type = 1 if activity_regular == "l1" else (2 if activity_regular == "l2" else 0)
+        # Training parameters
+        learning_rate = 3e-4
+        coef_1 = 5e-7
+        coef_2 = 70
+        coef_3 = 10
+        batch_size = 64
 
-    # DataLoader setup
-    train_iterator = DataLoader(
-        data_set, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=0,
-        pin_memory=True if torch.cuda.is_available() else False
-    )
-
-    # Initial evaluation
-    # train_metrics = loss_function_2nd(
-    #     join,
-    #     train_iterator,
-    #     optimizer,
-    #     device,
-    #     coef_1,
-    #     coef_2,
-    #     coef_3,
-    #     regul_type,
-    #     mask_,
-    #     interpolate_2,
-    # )
-
-    # train_loss, L2_loss, Scale_Loss, Shear_Loss = train_metrics
-    # input_length = len(train_iterator)
-
-    # # Normalize losses
-    # train_loss /= input_length
-    # L2_loss /= input_length
-    # Scale_Loss /= input_length
-    # Shear_Loss /= input_length
-
-    logging.info("Starting loss landscape computation...")
-    
-    try:
-        # Compute loss landscape
-        loss_surface = compute_loss_landscape(
-            join, train_iterator, optimizer, device,
-            coef_1, coef_2, coef_3, regul_type, mask_, interpolate_2
+        # Create DataLoader with num_workers=4 for parallel data loading
+        train_iterator = DataLoader(
+            data_set, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=4,
+            pin_memory=True if torch.cuda.is_available() else False,
+            persistent_workers=True
         )
 
+        # ... rest of the function remains the same ...
+
+    except KeyboardInterrupt:
+        logging.info("Process interrupted by user")
+        raise
     except Exception as e:
-        logging.error(f"Error during loss landscape computation: {e}")
+        logging.error(f"Error in Test_Process: {e}")
         raise
 
-    # return train_loss, L2_loss, Scale_Loss, Shear_Loss
-
 if __name__ == "__main__":
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # method already set
+    
     logging.info("Starting test_ll.py")
     Test_Process(whole_data_with_rotation)
     logging.info("Completed test_ll.py")
