@@ -103,7 +103,7 @@ plt.savefig("mask_up_1_2.png")
 
 print(f"load the data")
 data_dir = os.path.abspath(
-    "./Simulated_4dstemExtremely_Noisy_4DSTEM_Strain_Mapping_Using_CC_ST_AE_Simulated/polycrystal_output4D.mat"
+    "./Simulated_4dstem/Extremely_Noisy_4DSTEM_Strain_Mapping_Using_CC_ST_AE_Simulated/polycrystal_output4D.mat"
 )
 
 print(f" Load data function 2 for second training process")

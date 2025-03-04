@@ -45,7 +45,7 @@ def create_loss_landscape_plots(data_path, output_dir):
                                linewidths=0.5,
                                alpha=0.5)
     ax1.clabel(contour_lines, inline=True, fontsize=8, fmt='%.3f')
-    colorbar = plt.colorbar(contour_filled, ax=ax1, label='Loss', format='%.2f')
+    colorbar = plt.colorbar(contour_filled, ax=ax1, label='Loss', format='%.3f')
     colorbar.ax.tick_params(labelsize=10)
     ax1.set_xlabel('Direction 1', fontsize=12)
     ax1.set_ylabel('Direction 2', fontsize=12)
@@ -58,7 +58,7 @@ def create_loss_landscape_plots(data_path, output_dir):
     heatmap = ax2.pcolormesh(X, Y, z, 
                             norm=LogNorm(),
                             cmap='RdYlBu_r')
-    colorbar2 = plt.colorbar(heatmap, ax=ax2, label='Loss', format='%.2f')
+    colorbar2 = plt.colorbar(heatmap, ax=ax2, label='Loss', format='%.3f')
     colorbar2.ax.tick_params(labelsize=10)
     ax2.set_xlabel('Direction 1', fontsize=12)
     ax2.set_ylabel('Direction 2', fontsize=12)
@@ -73,7 +73,7 @@ def create_loss_landscape_plots(data_path, output_dir):
                            norm=LogNorm(z.min(), z.max()),
                            linewidth=0,
                            antialiased=True)
-    colorbar3 = plt.colorbar(surf, ax=ax3, label='Loss', format='%.2f')
+    colorbar3 = plt.colorbar(surf, ax=ax3, label='Loss', format='%.3f')
     colorbar3.ax.tick_params(labelsize=10)
     ax3.set_xlabel('Direction 1', fontsize=12)
     ax3.set_ylabel('Direction 2', fontsize=12)
@@ -93,7 +93,7 @@ def create_loss_landscape_plots(data_path, output_dir):
                           norm=LogNorm(z.min(), z.max()),
                           linewidth=0,
                           antialiased=True)
-    colorbar = plt.colorbar(surf, label='Loss', format='%.2f')
+    colorbar = plt.colorbar(surf, label='Loss', format='%.3f')
     colorbar.ax.tick_params(labelsize=10)
     ax.set_xlabel('Direction 1', fontsize=12)
     ax.set_ylabel('Direction 2', fontsize=12)
@@ -121,13 +121,13 @@ def create_loss_landscape_plots(data_path, output_dir):
                              antialiased=True)
         
         # Set up the colorbar with actual loss values
-        colorbar = plt.colorbar(surf, label='Loss', format='%.2f')
+        colorbar = plt.colorbar(surf, label='Loss', format='%.3f')
         colorbar.ax.tick_params(labelsize=10)
         
         # Convert log ticks to actual values for z-axis
         log_ticks = ax.get_zticks()
         actual_ticks = 10 ** log_ticks
-        ax.set_zticklabels([f'{x:.2f}' for x in actual_ticks])
+        ax.set_zticklabels([f'{x:.3f}' for x in actual_ticks])
         
         ax.set_xlabel('Direction 1', fontsize=12)
         ax.set_ylabel('Direction 2', fontsize=12)
@@ -138,7 +138,7 @@ def create_loss_landscape_plots(data_path, output_dir):
         # Convert colorbar ticks to actual values
         log_cticks = colorbar.ax.get_yticks()
         actual_cticks = 10 ** log_cticks
-        colorbar.ax.set_yticklabels([f'{x:.2f}' for x in actual_cticks])
+        colorbar.ax.set_yticklabels([f'{x:.3f}' for x in actual_cticks])
         
         plt.savefig(os.path.join(output_dir, f'loss_landscape_3d_log_view{i+1}.png'), dpi=300, bbox_inches='tight')
         plt.close()
