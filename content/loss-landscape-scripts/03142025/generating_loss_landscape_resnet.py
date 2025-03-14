@@ -1414,7 +1414,23 @@ def compute_loss_landscape(model, train_iterator, optimizer, device, steps=41, d
         
         # Initialize loss surface
         loss_surface = np.zeros((steps, steps))
+        # Get all data from train_iterator
+        all_x = []
+        all_y = []
+        for x_batch, y_batch in train_iterator:
+            all_x.append(x_batch)
+            all_y.append(y_batch)
+        x = torch.cat(all_x)
+        y = torch.cat(all_y)
         
+        # Randomly select 70% of indices
+        num_samples = len(x)
+        num_selected = int(0.01 * num_samples)
+        selected_indices = torch.randperm(num_samples)[:num_selected]
+        
+        # Get selected samples
+        x = x[selected_indices]
+        y = y[selected_indices]
         # Compute loss landscape
         with torch.no_grad():
             for i in tqdm(range(steps), desc="Computing loss landscape"):
@@ -1423,7 +1439,7 @@ def compute_loss_landscape(model, train_iterator, optimizer, device, steps=41, d
                     set_parameters(model, current_point)
                     
                     # Get batch of data
-                    x, y = next(iter(train_iterator))
+                    
                     x = x.to(device, dtype=torch.float)
                     y = y.to(device, dtype=torch.float)
                     
@@ -1470,5 +1486,5 @@ def compute_loss_landscape(model, train_iterator, optimizer, device, steps=41, d
 
 
 
-loss_surface = compute_loss_landscape(resnet50, train_iterator, optimizer, device, steps=101, distance=0.5)
+loss_surface = compute_loss_landscape(resnet50, train_iterator, optimizer, device, steps=41, distance=0.2)
 print(loss_surface)
