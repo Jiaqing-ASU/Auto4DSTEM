@@ -199,7 +199,6 @@ def revise_size_on_affine_gpu(image,
                               coef=2,
                               pare_reverse=False):
     
-#    img0 = np.zeros([image.shape[-1],image.shape[-1]])
     # Add another mask dealing with the diffraction pattern only
     np_img = np.zeros([radius*2,radius*2])
     dot_size = int(4*image.shape[-1]/200)
@@ -207,43 +206,31 @@ def revise_size_on_affine_gpu(image,
     small_square_mask = torch.tensor(small_square_mask,dtype=torch.bool).to(device)
 
     img = torch.clone(image).to(device)
-#    print(img.shape)
-    identity = torch.tensor([0,0,1],dtype= torch.float).reshape(1,1,3).repeat(batch_size,1,1).to(device)
-    new_theta = torch.cat((theta,identity),axis=1).to(device)
-    # Clone the tensor before inverse operation
-    new_theta_clone = new_theta.clone()
-    inver_theta = torch.linalg.inv(new_theta_clone)[:,0:2].to(device)
-#    print(theta.shape)
-##    print(inver_theta.shape)
-#    print('....')
+    
+    # Move tensors to CPU for inversion operations
+    theta_cpu = theta.detach().cpu()
+    identity = torch.tensor([0,0,1],dtype=torch.float).reshape(1,1,3).repeat(batch_size,1,1)  # Create on CPU
+    new_theta = torch.cat((theta_cpu, identity), axis=1)
+    
+    # Compute inverse on CPU without any detach/clone operations
+    inver_theta_full = torch.linalg.inv(new_theta)
+    inver_theta = inver_theta_full[:,0:2].to(device)  # Move back to device after computation
+    
     for j, mask in enumerate(mask_list):
         if mask.shape[0]!= batch_size:
             mask_ = mask.squeeze().unsqueeze(0).unsqueeze(1).repeat(batch_size,1,1,1).to(device)
         else:
             mask_ = mask.reshape(batch_size,1,mask.shape[-2],mask.shape[-1]).to(device)
-        
-#        print(mask_.shape)
-#        mask_ = torch.tensor(mask,dtype=torch.float,requires_grad=True).squeeze().unsqueeze(0).unsqueeze(1).repeat(batch_size,1,1,1)  
-#         grid = F.affine_grid(theta, mask_.size()) 
-#         mask_apply_affine = F.grid_sample(mask_, grid)
-#         mask_apply_affine = torch.tensor(mask_apply_affine,dtype=torch.bool)
 
         new_image = image*mask_.to(device)
-#        print(new_image.shape)
-#        new_image = new_image.detach().numpy()
+        
         for i in range(batch_size):
-    #        print(new_image[i].shape)
             center_x,center_y = center_of_mass(new_image[i].squeeze(),mask_[i].squeeze(),coef)
         
             center = torch.tensor([center_x,center_y]).to(device)
- #           print(center)
             x_coor,y_coor = crop_small_square(center_coordinates=center.clone(),radius = radius)
             
-            
-            #crop small square on image after affine transformation
-
- 
-         
+            # Crop small square on image after affine transformation
             small_image = img[i].squeeze()[x_coor[0]:x_coor[1],y_coor[0]:y_coor[1]].unsqueeze(0).unsqueeze(1).clone().to(device)
             re_grid = F.affine_grid(inver_theta[i].unsqueeze(0).to(device), small_image.size()).to(device) 
             
@@ -253,19 +240,14 @@ def revise_size_on_affine_gpu(image,
                 img[i,:,x_coor[0]:x_coor[1],y_coor[0]:y_coor[1]] = re_aff_small_image.squeeze()
                 
             else:
-                
-                
                 small_image_copy = torch.clone(small_image.squeeze()).to(device)
-    #             print(small_image_copy.shape)
-    #             print(small_square_mask.shape)
-    # Use the same parameter to fit all the diffraction patterns in mask reigon 
+                
                 if pare_reverse:
                     small_image_copy[small_square_mask]/=adj_para[i]
                 else:
                     small_image_copy[small_square_mask]*=adj_para[i]
                     
                 small_image_copy = small_image_copy.unsqueeze(0).unsqueeze(1)
-
 
                 re_aff_small_image = F.grid_sample(small_image_copy, re_grid, mode = 'bicubic')
                 img[i,:,x_coor[0]:x_coor[1],y_coor[0]:y_coor[1]] = re_aff_small_image.squeeze()
@@ -605,15 +587,22 @@ class Joint(nn.Module):
     
         identity = torch.tensor([0,0,1],dtype= torch.float).reshape(1,1,3).repeat(x.shape[0],1,1).to(self.device)
         
-        new_theta_1 = torch.cat((scaler_shear,identity),axis=1).to(self.device)
-        new_theta_2 = torch.cat((rotation,identity),axis=1).to(self.device)
+        # Create new tensors for the operations to avoid issues with DataParallel
+        scaler_shear_cpu = scaler_shear.detach().cpu()
+        rotation_cpu = rotation.detach().cpu()
+        identity_cpu = identity.detach().cpu()
         
-        # Clone the tensors before inverse operation
-        new_theta_1_clone = new_theta_1.clone()
-        new_theta_2_clone = new_theta_2.clone()
+        # Create new tensors on CPU to avoid CUDA synchronization issues
+        new_theta_1 = torch.cat((scaler_shear_cpu, identity_cpu), axis=1)
+        new_theta_2 = torch.cat((rotation_cpu, identity_cpu), axis=1)
         
-        inver_theta_1 = torch.linalg.inv(new_theta_1_clone)[:,0:2].to(self.device) 
-        inver_theta_2 = torch.linalg.inv(new_theta_2_clone)[:,0:2].to(self.device)
+        # Compute inverses on CPU
+        inver_theta_1_full = torch.linalg.inv(new_theta_1)
+        inver_theta_2_full = torch.linalg.inv(new_theta_2)
+        
+        # Extract needed columns and move to device
+        inver_theta_1 = inver_theta_1_full[:, 0:2].to(self.device)
+        inver_theta_2 = inver_theta_2_full[:, 0:2].to(self.device)
         
         predicted_base = self.decoder(k_out)
         
@@ -633,10 +622,7 @@ class Joint(nn.Module):
             grid_1 = F.affine_grid(inver_theta_1.to(self.device), x.size()).to(self.device)
             grid_2 = F.affine_grid(inver_theta_2.to(self.device), x.size()).to(self.device)
         
-        
-        
             predicted_rotate = F.grid_sample(predicted_base, grid_2)
-            
             predicted_input = F.grid_sample(predicted_rotate, grid_1)
         
             
@@ -798,8 +784,11 @@ def upsample_mask(mask_list, input_size, up_size):
 def basis2probe(rotation_,scale_shear_):
     
     M = []
-    #    G_ref_inv = np.linalg.inv(G_ref)
-    for i in tqdm(range(65536),leave=True,total=65536):
+    # Get the actual number of samples in the input data
+    num_samples = rotation_.shape[0]
+    
+    # Iterate over the actual data size
+    for i in tqdm(range(num_samples), leave=True, total=num_samples):
         
         theta = np.arctan2(rotation_[i][1], rotation_[i][0]) 
                        
@@ -819,16 +808,6 @@ def basis2probe(rotation_,scale_shear_):
             [yx,yy]
             ])
         m = np.linalg.inv(t) @ np.linalg.inv(r)
-
-        # t1 = np.array([
-        #     [xx,0],
-        #     [0,yy]
-        #     ])
-        # t2 = np.array([
-        #     [1,xy],
-        #     [yx,1]
-        #     ])
-        # m = r @ np.linalg.inv(t1) @ np.linalg.inv(t2)
         
         M.append(m)
         
@@ -877,30 +856,134 @@ def eval_matx(rotation,
               ref_region = (30,60,10,40),
               angle_shift = -9/180 * np.pi
              ):
-    M_shuyu = basis2probe(rotation,scale_shear).reshape(256,256,2,2)
-    exx_ae,eyy_ae,exy_ae = strain_tensor(M_shuyu,[256,256])
-    mae_shuyu_xx = np.mean(abs(exx_ae.reshape(-1) - label_xx))
-    mae_shuyu_yy = np.mean(abs(eyy_ae.reshape(-1) - label_yy))
-    mae_shuyu_xy = np.mean(abs(exy_ae.reshape(-1) - label_xy))
+    # Determine the actual size based on the input data
+    data_size = rotation.shape[0]
     
-    # create label value of rotation
-    label_rot = label_rot.reshape(256,256)
-    label_ref_rotation = np.mean(label_rot[ref_region[0]:ref_region[1],
-                                            ref_region[2]:ref_region[3]])
-    # calculate corresponding rotation based on reference 
-    label_rot = label_rot - label_ref_rotation
-    # create correct format of rotation for autoencoder
-    # calculate rotation autoencoder
-    rot_ae = np.mod(angle_shift+np.arctan2(rotation[:,1],
-                                rotation[:,0]).reshape(256,256),np.pi/3)
-    rot_ae_ref = np.mean(rot_ae[ref_region[0]:ref_region[1],
+    # The full dataset has 65536 samples, which is 256x256
+    expected_full_size = 65536
+    
+    # If we have the full dataset, use the original 256x256 grid directly
+    if data_size == expected_full_size:
+        print(f"Processing full dataset with 256x256 grid")
+        grid_side = 256
+        
+        # Reshape based on the actual data size
+        M_shuyu = basis2probe(rotation, scale_shear).reshape(grid_side, grid_side, 2, 2)
+        exx_ae, eyy_ae, exy_ae = strain_tensor(M_shuyu, [grid_side, grid_side], ref_region)
+        
+        # Original code path for full data
+        mae_shuyu_xx = np.mean(abs(exx_ae.reshape(-1) - label_xx))
+        mae_shuyu_yy = np.mean(abs(eyy_ae.reshape(-1) - label_yy))
+        mae_shuyu_xy = np.mean(abs(exy_ae.reshape(-1) - label_xy))
+        
+        # Create label value of rotation
+        label_rot_reshaped = label_rot.reshape(grid_side, grid_side)
+        label_ref_rotation = np.mean(label_rot_reshaped[ref_region[0]:ref_region[1],
                                                 ref_region[2]:ref_region[3]])
-    # calculate corresponding rotation based on reference 
-    rot_ae = rot_ae - rot_ae_ref
+        # Calculate corresponding rotation based on reference 
+        label_rot_reshaped = label_rot_reshaped - label_ref_rotation
+        
+        # Create correct format of rotation for autoencoder
+        # Calculate rotation autoencoder
+        rot_ae = np.mod(angle_shift + np.arctan2(rotation[:, 1],
+                                    rotation[:, 0]).reshape(grid_side, grid_side), np.pi/3)
+        rot_ae_ref = np.mean(rot_ae[ref_region[0]:ref_region[1],
+                                                ref_region[2]:ref_region[3]])
+        # Calculate corresponding rotation based on reference 
+        rot_ae = rot_ae - rot_ae_ref
+        
+        combine_loss = mae_shuyu_xx + mae_shuyu_yy + mae_shuyu_xy
+        combine_loss_with_rot = combine_loss + np.mean(abs(rot_ae - label_rot_reshaped))
+        
+    else:
+        # For smaller datasets, calculate the best grid dimensions
+        grid_side = int(np.sqrt(data_size))
+        
+        # If we have enough data for a square grid, reshape to that
+        if grid_side * grid_side == data_size:
+            print(f"Processing data with {grid_side}x{grid_side} grid")
+            
+            # Scale the reference region for smaller grid sizes
+            scale_factor = grid_side / 256
+            scaled_ref_region = (
+                int(ref_region[0] * scale_factor),
+                int(ref_region[1] * scale_factor),
+                int(ref_region[2] * scale_factor),
+                int(ref_region[3] * scale_factor)
+            )
+            
+            # Ensure the region boundaries are valid
+            scaled_ref_region = (
+                max(0, scaled_ref_region[0]),
+                min(grid_side, scaled_ref_region[1]),
+                max(0, scaled_ref_region[2]),
+                min(grid_side, scaled_ref_region[3])
+            )
+            
+            # Check that the region is not empty
+            if scaled_ref_region[1] <= scaled_ref_region[0] or scaled_ref_region[3] <= scaled_ref_region[2]:
+                # Use a default region if the scaling makes it invalid
+                scaled_ref_region = (0, max(1, grid_side // 8), 0, max(1, grid_side // 8))
+            
+            # Reshape and process as a grid
+            M_shuyu = basis2probe(rotation, scale_shear).reshape(grid_side, grid_side, 2, 2)
+            exx_ae, eyy_ae, exy_ae = strain_tensor(M_shuyu, [grid_side, grid_side], scaled_ref_region)
+            
+            # Compute metrics
+            mae_shuyu_xx = np.mean(abs(exx_ae.reshape(-1) - label_xx[:data_size]))
+            mae_shuyu_yy = np.mean(abs(eyy_ae.reshape(-1) - label_yy[:data_size]))
+            mae_shuyu_xy = np.mean(abs(exy_ae.reshape(-1) - label_xy[:data_size]))
+            
+            # Handle rotation calculation
+            label_rot_reshaped = label_rot[:data_size].reshape(grid_side, grid_side)
+            label_ref_rotation = np.mean(label_rot_reshaped[scaled_ref_region[0]:scaled_ref_region[1],
+                                                    scaled_ref_region[2]:scaled_ref_region[3]])
+            label_rot_reshaped = label_rot_reshaped - label_ref_rotation
+            
+            rot_ae = np.mod(angle_shift + np.arctan2(rotation[:, 1],
+                                        rotation[:, 0]).reshape(grid_side, grid_side), np.pi/3)
+            rot_ae_ref = np.mean(rot_ae[scaled_ref_region[0]:scaled_ref_region[1],
+                                                    scaled_ref_region[2]:scaled_ref_region[3]])
+            rot_ae = rot_ae - rot_ae_ref
+            
+            combine_loss = mae_shuyu_xx + mae_shuyu_yy + mae_shuyu_xy
+            combine_loss_with_rot = combine_loss + np.mean(abs(rot_ae - label_rot_reshaped))
+            
+        else:
+            # For non-square datasets, use a simplified approach
+            print(f"Using simplified analysis for non-square dataset of size {data_size}")
+            
+            # Get the strain metrics without reshaping
+            M_shuyu = basis2probe(rotation, scale_shear)
+            
+            # Extract the information directly
+            exx_ae_flat = np.zeros(data_size)
+            eyy_ae_flat = np.zeros(data_size)
+            exy_ae_flat = np.zeros(data_size)
+            
+            # Use the first few samples to create a reference
+            M_ref = np.mean(M_shuyu[:min(100, data_size)], axis=0)
+            
+            for i in range(data_size):
+                T = M_shuyu[i] @ np.linalg.inv(M_ref)
+                u, p = sp.linalg.polar(T, side='left')
+                exx_ae_flat[i] = p[1, 1] - 1
+                eyy_ae_flat[i] = p[0, 0] - 1
+                exy_ae_flat[i] = p[0, 1]
+            
+            # Compute MAEs directly
+            mae_shuyu_xx = np.mean(abs(exx_ae_flat - label_xx[:data_size]))
+            mae_shuyu_yy = np.mean(abs(eyy_ae_flat - label_yy[:data_size]))
+            mae_shuyu_xy = np.mean(abs(exy_ae_flat - label_xy[:data_size]))
+            
+            # Calculate rotation metrics
+            rot_ae = np.mod(angle_shift + np.arctan2(rotation[:, 1], rotation[:, 0]), np.pi/3)
+            label_rot_subset = label_rot[:data_size]
+            
+            combine_loss = mae_shuyu_xx + mae_shuyu_yy + mae_shuyu_xy
+            combine_loss_with_rot = combine_loss + np.mean(abs(rot_ae - label_rot_subset))
     
-    combine_loss = mae_shuyu_xx + mae_shuyu_yy + mae_shuyu_xy
-    combine_loss_with_rot = combine_loss+ np.mean(abs(rot_ae-label_rot))
-    return combine_loss,combine_loss_with_rot
+    return combine_loss, combine_loss_with_rot
 
 
 data_dir = os.path.abspath("Simulated_4dstem/Extremely_Noisy_4DSTEM_Strain_Mapping_Using_CC_ST_AE_Simulated/polycrystal_output4D.mat")
@@ -929,25 +1012,26 @@ def Test_Process(data_set,
                  label_xx = label_xx,
                  label_yy = label_yy,
                  label_xy = label_xy,
-                 label_rot = label_rot
+                 label_rot = label_rot,
+                 model = None  # Add parameter to accept an existing model
                 ):
-        
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = "cuda"
-        
-        print('.........a step.........')
-
-        print('.........b step.........')
-
-        learning_rate = 3e-4
-        
-        patience = 0
-        batch_size = 64
-        print("........successfully load parameters")
-        
-        encoder, decoder, join, optimizer = \
-        make_model_2(device,learning_rate = learning_rate,fixed_mask = mask_)
+            
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    
+    print('.........a step.........')
+    print('.........b step.........')
+    learning_rate = 3e-4
+    batch_size = 64
+    print("........successfully load parameters")
+    
+    # Use the provided model if available, otherwise create a new one
+    if model is not None:
+        join = model
+        print('..........using provided model')
+    else:
+        encoder, decoder, join, optimizer = make_model_2(device, learning_rate=learning_rate, fixed_mask=mask_)
 
         checkpoint = "2nd_train_weight_25Per.pkl"
         pre_weight = torch.load(checkpoint)
@@ -958,51 +1042,355 @@ def Test_Process(data_set,
             name = k.replace("module.", "")  # Remove 'module.' prefix
             new_state_dict[name] = v
         
-        # Load state dict before wrapping with DataParallel
+        # Load state dict (don't use DataParallel)
         join.load_state_dict(new_state_dict)
-        
-        # Now wrap with DataParallel
-        join = torch.nn.parallel.DataParallel(join)
-            
         print('..........successfully generate model')
-        
-        
-        train_iterator = DataLoader(data_set, batch_size=batch_size, shuffle=False, num_workers=0)
-
-        print('...........successfully generate train interator')
-        rotation_ = np.zeros([65536,2])
-        scale_shear_ = np.zeros([65536,4])
-
-        with torch.no_grad():
-            for i,val in enumerate(tqdm(train_iterator, leave=True, total=len(train_iterator))):
-                x,y = val
-                x = x.to(device, dtype=torch.float)
-                y = y.to(device, dtype=torch.float)
-                if Up_inp:
-                    
-                    predicted_x,predicted_base,predicted_input,kout,theta_1,theta_2,adj_mask,new_list,x_inp = join(x,y)                    
-                    mask_ = upsample_mask(mask_,x.shape[-1], x_inp.shape[-1])
-                    
-                else:
-                    predicted_x,predicted_base,predicted_input,kout,theta_1,theta_2,adj_mask,new_list= join(x,y)
     
+    train_iterator = DataLoader(data_set, batch_size=batch_size, shuffle=False, num_workers=0)
+    print('...........successfully generate train interator')
+    
+    # Pre-allocate arrays of the correct size
+    data_size = len(data_set)
+    rotation_ = np.zeros([data_size, 2])
+    scale_shear_ = np.zeros([data_size, 4])
 
-                rotation_[i*batch_size:(i+1)*batch_size] = theta_2[:,:,0].cpu().detach().numpy()
-
-                scale_shear_[i*batch_size:(i+1)*batch_size] = theta_1[:,:,0:2].cpu().detach().numpy().reshape(-1,4)
+    with torch.no_grad():
+        for i, val in enumerate(tqdm(train_iterator, leave=True, total=len(train_iterator))):
+            x, y = val
+            x = x.to(device, dtype=torch.float)
+            y = y.to(device, dtype=torch.float)
                 
-        combine_loss,combine_loss_with_rot = eval_matx(rotation_,
-                                              scale_shear_,
-                                              label_xx,
-                                              label_yy,
-                                              label_xy,
-                                              label_rot)
+            if Up_inp:
+                predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, adj_mask, new_list, x_inp = join(x, y)
+                mask_ = upsample_mask(mask_, x.shape[-1], x_inp.shape[-1])
+            else:
+                predicted_x, predicted_base, predicted_input, kout, theta_1, theta_2, adj_mask, new_list = join(x, y)
 
+            # Only fill the portion of the array we actually have data for
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, data_size)
 
-        return combine_loss,combine_loss_with_rot
+            rotation_[start_idx:end_idx] = theta_2[:end_idx-start_idx, :, 0].cpu().detach().numpy()
+            scale_shear_[start_idx:end_idx] = theta_1[:end_idx-start_idx, :, 0:2].cpu().detach().numpy().reshape(-1, 4)
+            
+    combine_loss, combine_loss_with_rot = eval_matx(rotation_,
+                                          scale_shear_,
+                                          label_xx,
+                                          label_yy,
+                                          label_xy,
+                                          label_rot)
 
-combine_loss,combine_loss_with_rot = Test_Process(whole_data_with_rotation)
+    return combine_loss, combine_loss_with_rot
 
-print("combine_loss: ", combine_loss)
-print("combine_loss_with_rot: ", combine_loss_with_rot)
+# combine_loss,combine_loss_with_rot = Test_Process(whole_data_with_rotation)
+
+# print("combine_loss: ", combine_loss)
+# print("combine_loss_with_rot: ", combine_loss_with_rot)
+
+# Define constants for the loss landscape computation
+STEPS = 25  # Number of steps in each direction
+DISTANCE = 1.0  # Total distance to travel in parameter space
+
+def compute_combine_loss_landscape(join, data_set, device, mask_=mask_list_1, Up_inp=False, steps=STEPS, distance=DISTANCE, rotation_file="25Percent_rotation_071323"):
+    """
+    Compute two loss landscapes along a planar subspace of the parameter space:
+    1. One based on combine_loss (strain metrics only)
+    2. One based on combine_loss_with_rot (strain metrics + rotation)
+    """
+    try:
+        # Get starting parameters and save original weights with proper deep copy
+        with torch.no_grad():
+            start_point = get_model_parameters(join)
+            original_weights = clone_parameters(start_point)
+        
+        # Generate random orthogonal directions
+        dir_one = rand_uniform_like(start_point)
+        dir_two = make_orthogonal(dir_one)
+        
+        # Normalize directions using filter normalization
+        dir_one = normalize_direction(dir_one, start_point, normalization='filter')
+        dir_two = normalize_direction(dir_two, start_point, normalization='filter')
+        
+        # Scale directions to match steps and total distance
+        model_norm = get_model_norm(start_point)
+        
+        # Scale to match steps and total distance
+        dir_one_norm = get_model_norm(dir_one)
+        dir_two_norm = get_model_norm(dir_two)
+        mul_(dir_one, ((model_norm * distance) / steps) / dir_one_norm)
+        mul_(dir_two, ((model_norm * distance) / steps) / dir_two_norm)
+        
+        # Move start point to corner and adjust step size
+        mul_(dir_one, steps / 2)
+        mul_(dir_two, steps / 2)
+        current_point = clone_parameters(original_weights)
+        sub_direction(current_point, dir_one)
+        sub_direction(current_point, dir_two)
+        truediv_(dir_one, steps / 2)
+        truediv_(dir_two, steps / 2)
+        
+        # Initialize loss surfaces
+        loss_surface_combine = np.zeros((steps, steps))
+        loss_surface_with_rot = np.zeros((steps, steps))
+        
+        # Verify original_weights and current_point are different
+        weight_diff = sum(torch.sum((c - o).abs()) for c, o in zip(current_point, original_weights))
+        logging.info(f"Initial weight difference from original: {weight_diff.item()}")
+        print(f"Initial weight difference from original: {weight_diff.item()}")
+        
+        if weight_diff.item() < 1e-6:
+            raise ValueError("Starting point is too close to original weights - directions may not be properly scaled")
+        
+        # Compute loss landscapes
+        data_matrix_combine = []
+        data_matrix_with_rot = []
+        
+        with torch.no_grad():
+            for i in tqdm(range(steps), desc="Computing loss landscape"):
+                data_column_combine = []
+                data_column_with_rot = []
+                
+                for j in range(steps):
+                    # Set model weights to current grid point
+                    set_parameters(join, current_point)
+                    
+                    # Compute the combine_loss and combine_loss_with_rot at this point
+                    # Pass the model to avoid recreating it each time
+                    combine_loss, combine_loss_with_rot = Test_Process(
+                        data_set=data_set,
+                        mask_=mask_,
+                        Up_inp=Up_inp,
+                        label_xx=label_xx,
+                        label_yy=label_yy,
+                        label_xy=label_xy,
+                        label_rot=label_rot,
+                        model=join  # Pass the model
+                    )
+                    
+                    # For every other column, reverse the order in which the column is generated
+                    if i % 2 == 0:
+                        add_direction(current_point, dir_two)
+                        data_column_combine.append(combine_loss)
+                        data_column_with_rot.append(combine_loss_with_rot)
+                    else:
+                        sub_direction(current_point, dir_two)
+                        data_column_combine.insert(0, combine_loss)
+                        data_column_with_rot.insert(0, combine_loss_with_rot)
+                
+                data_matrix_combine.append(data_column_combine)
+                data_matrix_with_rot.append(data_column_with_rot)
+                add_direction(current_point, dir_one)
+                
+                # Clear GPU memory periodically
+                if i % 2 == 0:
+                    torch.cuda.empty_cache()
+                
+                logging.info(f"Completed row {i+1}/{steps}")
+        
+        # Convert to numpy arrays
+        loss_surface_combine = np.array(data_matrix_combine)
+        loss_surface_with_rot = np.array(data_matrix_with_rot)
+        
+        # Create directory if it doesn't exist
+        save_dir = 'loss_landscapes'
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Extract percentage from filename
+        percentage = rotation_file.split('_')[0]
+        
+        # Create filenames with parameters
+        filename_combine = f"{percentage}_steps{steps}_dist{distance:.1f}_combine_loss_landscape.npz"
+        filename_with_rot = f"{percentage}_steps{steps}_dist{distance:.1f}_combine_loss_with_rot_landscape.npz"
+        
+        save_path_combine = os.path.join(save_dir, filename_combine)
+        save_path_with_rot = os.path.join(save_dir, filename_with_rot)
+        
+        # Save results
+        np.savez(save_path_combine, 
+                 loss_surface=loss_surface_combine,
+                 x_coordinates=np.linspace(-distance, distance, steps),
+                 y_coordinates=np.linspace(-distance, distance, steps))
+        
+        np.savez(save_path_with_rot, 
+                 loss_surface=loss_surface_with_rot,
+                 x_coordinates=np.linspace(-distance, distance, steps),
+                 y_coordinates=np.linspace(-distance, distance, steps))
+        
+        logging.info(f"Successfully saved combine loss landscape data to {save_path_combine}")
+        logging.info(f"Successfully saved combine loss with rotation landscape data to {save_path_with_rot}")
+        
+        # Visualize the loss landscapes
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+            
+            # Create 3D plots for both loss landscapes
+            fig = plt.figure(figsize=(20, 10))
+            
+            # Plot combine_loss landscape
+            ax1 = fig.add_subplot(121, projection='3d')
+            X, Y = np.meshgrid(np.linspace(-distance, distance, steps), np.linspace(-distance, distance, steps))
+            ax1.plot_surface(X, Y, loss_surface_combine, cmap=cm.coolwarm, linewidth=0, antialiased=True)
+            ax1.set_title('Combine Loss Landscape')
+            ax1.set_xlabel('Direction 1')
+            ax1.set_ylabel('Direction 2')
+            ax1.set_zlabel('Loss')
+            
+            # Plot combine_loss_with_rot landscape
+            ax2 = fig.add_subplot(122, projection='3d')
+            ax2.plot_surface(X, Y, loss_surface_with_rot, cmap=cm.coolwarm, linewidth=0, antialiased=True)
+            ax2.set_title('Combine Loss with Rotation Landscape')
+            ax2.set_xlabel('Direction 1')
+            ax2.set_ylabel('Direction 2')
+            ax2.set_zlabel('Loss')
+            
+            # Save figure
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{percentage}_loss_landscapes_comparison.png"), dpi=300)
+            plt.close()
+            
+            # Also create contour plots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+            
+            cs1 = ax1.contourf(X, Y, loss_surface_combine, levels=20, cmap=cm.coolwarm)
+            ax1.set_title('Combine Loss Contour')
+            ax1.set_xlabel('Direction 1')
+            ax1.set_ylabel('Direction 2')
+            fig.colorbar(cs1, ax=ax1)
+            
+            cs2 = ax2.contourf(X, Y, loss_surface_with_rot, levels=20, cmap=cm.coolwarm)
+            ax2.set_title('Combine Loss with Rotation Contour')
+            ax2.set_xlabel('Direction 1')
+            ax2.set_ylabel('Direction 2')
+            fig.colorbar(cs2, ax=ax2)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{percentage}_loss_landscapes_contours.png"), dpi=300)
+            plt.close()
+            
+            logging.info(f"Successfully created and saved loss landscape visualizations")
+            
+        except Exception as viz_error:
+            logging.error(f"Error visualizing loss landscapes: {viz_error}")
+            
+    except Exception as e:
+        logging.error(f"Error during loss landscape computation: {e}")
+        raise
+        
+    finally:
+        # Restore original weights
+        set_parameters(join, original_weights)
+        
+    return loss_surface_combine, loss_surface_with_rot
+
+# Add helper functions needed for the loss landscape computation
+def clone_parameters(parameters):
+    return [p.clone() for p in parameters]
+
+def get_model_parameters(model):
+    return [param.data for param in model.parameters()]
+
+def set_parameters(model, parameters):
+    for p, q in zip(model.parameters(), parameters):
+        p.data = q.clone()
+        
+def get_model_norm(parameters, order=2):
+    sqsum = 0.0
+    for p in parameters:
+        sqsum += torch.norm(p.flatten(), p=order) ** order
+    return torch.pow(sqsum, 1.0 / order)
+
+def normalize_direction(direction, parameters, normalization='filter'):
+    if normalization == 'model':
+        norm = get_model_norm(direction)
+        for d in direction:
+            d.div_(norm)
+    elif normalization == 'filter':
+        for d, p in zip(direction, parameters):
+            filter_norm = torch.norm(d.flatten(), p=2)
+            if filter_norm > 0:
+                d.div_(filter_norm)
+    return direction
+
+def make_orthogonal(direction_one):
+    direction_two = rand_uniform_like(direction_one)
+    # Make direction_two orthogonal to direction_one
+    dir_dot = sum(torch.sum(d1 * d2) for d1, d2 in zip(direction_one, direction_two))
+    norm_sq = sum(torch.sum(d1 * d1) for d1 in direction_one)
+    for d1, d2 in zip(direction_one, direction_two):
+        d2.add_(-dir_dot * d1 / norm_sq)
+    return direction_two
+
+def rand_uniform_like(parameters):
+    return [torch.randn_like(p) for p in parameters]
+
+def scale_direction(direction, scale):
+    for d in direction:
+        d.mul_(scale)
+    return direction
+
+def mul_(parameters, scale):
+    for p in parameters:
+        p.mul_(scale)
+        
+def truediv_(parameters, scale):
+    for p in parameters:
+        p.div_(scale)
+
+def add_direction(parameters, direction):
+    for p, d in zip(parameters, direction):
+        p.add_(d)
+        
+def sub_direction(parameters, direction):
+    for p, d in zip(parameters, direction):
+        p.sub_(d)
+
+# Run the loss landscape computation
+if __name__ == "__main__":
+    print("Computing combine loss landscapes...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create the model at the global scope
+    print("Creating model for loss landscape analysis...")
+    encoder, decoder, join, optimizer = make_model_2(
+        device=device,
+        learning_rate=3e-4,
+        fixed_mask=mask_list_1
+    )
+    
+    # Load the model weights
+    checkpoint = "2nd_train_weight_25Per.pkl"
+    pre_weight = torch.load(checkpoint)
+    
+    # Remove 'module.' prefix from state dict keys
+    new_state_dict = {}
+    for k, v in pre_weight["net"].items():
+        name = k.replace("module.", "")  # Remove 'module.' prefix
+        new_state_dict[name] = v
+    
+    # Load state dict
+    join.load_state_dict(new_state_dict)
+    
+    # DO NOT wrap with DataParallel to avoid issues with tensor operations
+    # join = torch.nn.parallel.DataParallel(join)
+    
+    print("Model created successfully. Starting loss landscape computation...")
+    
+    # For the actual loss landscape, use the entire dataset
+    print(f"Using the entire dataset of size {len(whole_data_with_rotation)} samples")
+    
+    # Use appropriate steps and distance for a comprehensive loss landscape
+    loss_surface_combine, loss_surface_with_rot = compute_combine_loss_landscape(
+        join=join,
+        data_set=whole_data_with_rotation,  # Use the full dataset
+        device=device,
+        mask_=mask_list_1,
+        Up_inp=False,
+        steps=15,  # More steps for a more detailed landscape
+        distance=0.5,  # Good trade-off between detail and computational cost
+        rotation_file="25Percent_rotation_071323"
+    )
+    print("Loss landscape computation complete.")
+    print("Saved landscape data in the 'loss_landscapes' directory")
 

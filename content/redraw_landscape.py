@@ -23,6 +23,16 @@ def create_loss_landscape_plots(data_path, output_dir):
     y = data['y_coordinates']  # y coordinates
     X, Y = np.meshgrid(x, y)
     
+    # Print loss landscape information
+    print("Loss Landscape Information:")
+    print(f"  Shape: {z.shape}")
+    print(f"  Min: {z.min():.6f}")
+    print(f"  Max: {z.max():.6f}")
+    print(f"  Mean: {z.mean():.6f}")
+    print(f"  Median: {np.median(z):.6f}")
+    print(f"  X range: {x.min():.3f} to {x.max():.3f}")
+    print(f"  Y range: {y.min():.3f} to {y.max():.3f}")
+    
     # Verify dimensions match global settings
     if len(x) != STEPS or len(y) != STEPS:
         print(f"Warning: Data dimensions ({len(x)}x{len(y)}) don't match STEPS ({STEPS})")
